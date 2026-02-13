@@ -1,0 +1,3 @@
+[submodule "zeus"]
+	path = zeus
+	url = git@github.com:myzeus/zeus.git
