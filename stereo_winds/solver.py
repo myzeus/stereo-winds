@@ -13,6 +13,8 @@ Design matrix H (8x5) per pixel constructed from:
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 
 from .config import SatelliteConfig
@@ -22,6 +24,8 @@ from .navigation import (
     pixel_to_scanning_angle,
     scanning_angle_to_pixel,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def compute_parallax_vectors(
@@ -71,6 +75,60 @@ def compute_parallax_vectors(
     # Δpixel = Δangle / scale
     w_u = par_x / sat_a.scale_x / dh  # pixels per meter
     w_v = par_y / sat_a.scale_y / dh  # pixels per meter
+
+    return w_u, w_v
+
+
+def compute_parallax_vectors_at_h(
+    sat_a: SatelliteConfig,
+    sat_b: SatelliteConfig,
+    h_m: np.ndarray | float,
+    dh: float = 1000.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-pixel parallax sensitivity vectors evaluated at height h_m.
+
+    Same as ``compute_parallax_vectors`` but the finite-difference is taken
+    around *h_m* instead of h=0, capturing the nonlinear dependence of
+    parallax geometry on cloud-top height.
+
+    Parameters
+    ----------
+    sat_a, sat_b : SatelliteConfig
+    h_m : (n_rows, n_cols) array or scalar
+        Height in meters at which to evaluate the parallax.
+    dh : float
+        Height perturbation in meters for finite differences.
+
+    Returns
+    -------
+    w_u, w_v : (n_rows, n_cols) arrays
+        Parallax sensitivity in pixels per meter of height.
+    """
+    rows = np.arange(sat_a.n_rows)
+    cols = np.arange(sat_a.n_cols)
+    col_grid, row_grid = np.meshgrid(cols, rows)
+
+    # Inverse-project A's pixels to (lat, lon) at h = 0
+    # (the pixel grid is defined at h=0; we evaluate parallax at h_m)
+    x_a, y_a = pixel_to_scanning_angle(col_grid, row_grid, sat_a)
+    lat, lon = fixed_grid_to_geodetic(x_a, y_a, sat_a)
+
+    h_m = np.broadcast_to(np.asarray(h_m, dtype=np.float64),
+                           (sat_a.n_rows, sat_a.n_cols))
+
+    # Project (lat, lon) at h_m and h_m+dh into both satellites' grids
+    xb_lo, yb_lo = geodetic_to_fixed_grid(lat, lon, sat_b, h_m=h_m)
+    xb_hi, yb_hi = geodetic_to_fixed_grid(lat, lon, sat_b, h_m=h_m + dh)
+
+    xa_lo, ya_lo = geodetic_to_fixed_grid(lat, lon, sat_a, h_m=h_m)
+    xa_hi, ya_hi = geodetic_to_fixed_grid(lat, lon, sat_a, h_m=h_m + dh)
+
+    # Differential parallax at height h_m
+    par_x = (xb_hi - xb_lo) - (xa_hi - xa_lo)
+    par_y = (yb_hi - yb_lo) - (ya_hi - ya_lo)
+
+    w_u = par_x / sat_a.scale_x / dh
+    w_v = par_y / sat_a.scale_y / dh
 
     return w_u, w_v
 
@@ -145,11 +203,66 @@ def build_design_matrix(
     return H_mat
 
 
+def _solve_wls(
+    H_matrix: np.ndarray,
+    y: np.ndarray,
+    W: np.ndarray,
+    regularization: float = 1e-10,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Single-pass WLS solve (internal helper).
+
+    Returns (x, chi2, sigma_h, sigma_u, sigma_v).
+    """
+    H_px, W_px = H_matrix.shape[:2]
+
+    sqrt_W = np.sqrt(W)
+    H_w = H_matrix * sqrt_W[..., np.newaxis]
+    y_w = y * sqrt_W
+
+    # Column scaling for stability
+    col_norms = np.sqrt(np.einsum("...ki,...ki->...i", H_w, H_w))
+    col_norms = np.where(col_norms > 0, col_norms, 1.0)
+
+    H_scaled = H_w / col_norms[:, :, np.newaxis, :]
+
+    A = np.einsum("...ki,...kj->...ij", H_scaled, H_scaled)
+    b = np.einsum("...ki,...k->...i", H_scaled, y_w)
+
+    reg = np.eye(5, dtype=np.float64) * regularization
+    A = A + reg
+
+    x_scaled = np.linalg.solve(A, b[..., np.newaxis])[..., 0]
+    x = x_scaled / col_norms
+
+    # Residuals
+    y_pred = np.einsum("...ij,...j->...i", H_matrix, x)
+    residual = y - y_pred
+    chi2 = np.sum((residual**2) * W, axis=-1)
+
+    # Formal uncertainties
+    try:
+        C_scaled = np.linalg.inv(A)
+        inv_norms = 1.0 / col_norms
+        C = C_scaled * inv_norms[:, :, :, np.newaxis] * inv_norms[:, :, np.newaxis, :]
+        sigma_h = np.sqrt(np.maximum(C[:, :, 0, 0], 0.0))
+        sigma_u = np.sqrt(np.maximum(C[:, :, 3, 3], 0.0))
+        sigma_v = np.sqrt(np.maximum(C[:, :, 4, 4], 0.0))
+    except np.linalg.LinAlgError:
+        sigma_h = np.full((H_px, W_px), np.nan)
+        sigma_u = np.full((H_px, W_px), np.nan)
+        sigma_v = np.full((H_px, W_px), np.nan)
+
+    return x, chi2, sigma_h, sigma_u, sigma_v
+
+
 def solve_stereo_winds(
     disparities: dict[str, np.ndarray],
     H_matrix: np.ndarray,
     weights: np.ndarray | None = None,
     regularization: float = 1e-10,
+    sat_a: SatelliteConfig | None = None,
+    sat_b: SatelliteConfig | None = None,
+    n_iter: int = 1,
 ) -> dict[str, np.ndarray]:
     """Solve the 5-state weighted least squares system per pixel.
 
@@ -162,65 +275,84 @@ def solve_stereo_winds(
         Per-observation weights.  None = equal weights.
     regularization : float
         Tikhonov regularization added to diagonal of normal matrix.
+    sat_a, sat_b : SatelliteConfig or None
+        Satellite configs needed for iterative solve (n_iter > 1).
+        When None and n_iter > 1, falls back to a single-pass solve.
+    n_iter : int
+        Number of iterations.  At each iteration after the first, parallax
+        vectors are recomputed at the current height estimate, capturing
+        the nonlinear dependence of parallax geometry on height.
 
     Returns
     -------
     solution : dict with keys h, p_u, p_v, V_u, V_v, chi2, sigma_h,
-               sigma_u, sigma_v, quality_flag
+               sigma_u, sigma_v, quality_flag, delta_h_history
     """
+    H_matrix = H_matrix.copy()
     H_px, W_px = H_matrix.shape[:2]
 
-    # Stack 8 observations: [D1_u, D1_v, D2_u, D2_v, D3_u, D3_v, D4_u, D4_v]
+    # Stack 8 observations
     y = np.zeros((H_px, W_px, 8), dtype=np.float64)
     for i, key in enumerate(["D1", "D2", "D3", "D4"]):
-        flow = disparities[key]  # (2, H, W)
-        y[:, :, 2 * i] = flow[0]      # u component
-        y[:, :, 2 * i + 1] = flow[1]  # v component
+        flow = disparities[key]
+        y[:, :, 2 * i] = flow[0]
+        y[:, :, 2 * i + 1] = flow[1]
 
-    H = H_matrix  # (H, W, 8, 5)
-
-    # Weight matrix (diagonal)
     if weights is None:
         W = np.ones((H_px, W_px, 8), dtype=np.float64)
     else:
         W = weights
 
-    # Apply weights by scaling H and y
-    sqrt_W = np.sqrt(W)
-    H_w = H * sqrt_W[..., np.newaxis]  # (H, W, 8, 5)
-    y_w = y * sqrt_W  # (H, W, 8)
+    can_iterate = n_iter > 1 and sat_a is not None and sat_b is not None
+    actual_iters = n_iter if can_iterate else 1
 
-    # Solve via SVD-based lstsq for numerical stability.
-    # The design matrix has extreme dynamic range (parallax ~1e-6 vs
-    # time offsets ~600), making the normal equations ill-conditioned.
-    # Reshape to (N_pixels, 8, 5) for vectorized lstsq.
-    H_flat = H_w.reshape(-1, 8, 5)   # (N, 8, 5)
-    y_flat = y_w.reshape(-1, 8, 1)   # (N, 8, 1)
+    delta_h_history = []
+    h_prev = None
 
-    # np.linalg.lstsq on batched arrays: solve each pixel independently
-    # lstsq doesn't support batched dims, so use the normal equations
-    # with a column-scaled approach for stability.
-    #
-    # Column scaling: normalize each column of H to unit norm to improve
-    # conditioning, then rescale the solution.
-    col_norms = np.sqrt(np.einsum("...ki,...ki->...i", H_w, H_w))  # (H, W, 5)
-    col_norms = np.where(col_norms > 0, col_norms, 1.0)
+    for iteration in range(actual_iters):
+        x, chi2, sigma_h, sigma_u, sigma_v = _solve_wls(
+            H_matrix, y, W, regularization,
+        )
+        h = x[:, :, 0]
 
-    H_scaled = H_w / col_norms[:, :, np.newaxis, :]  # (H, W, 8, 5)
+        if h_prev is not None:
+            delta_h = np.abs(h - h_prev)
+            valid_delta = np.isfinite(delta_h) & (h > 0) & (h < 20000)
+            if valid_delta.any():
+                med_delta = float(np.median(delta_h[valid_delta]))
+            else:
+                med_delta = 0.0
+            delta_h_history.append(med_delta)
 
-    # Normal equations with scaled H
-    A = np.einsum("...ki,...kj->...ij", H_scaled, H_scaled)  # (H, W, 5, 5)
-    b = np.einsum("...ki,...k->...i", H_scaled, y_w)  # (H, W, 5)
+            # Log stats for high clouds
+            high_mask = valid_delta & (h > 8000)
+            if high_mask.any():
+                mean_high = float(np.mean(delta_h[high_mask]))
+                logger.info(
+                    "Iter %d: median |Δh| = %.1f m, "
+                    "high cloud (>8km) mean |Δh| = %.1f m",
+                    iteration, med_delta, mean_high,
+                )
 
-    # Small regularization on the scaled system
-    reg = np.eye(5, dtype=np.float64) * regularization
-    A = A + reg
+            if med_delta < 50.0:
+                logger.info(
+                    "Converged at iteration %d (median |Δh| = %.1f m)",
+                    iteration, med_delta,
+                )
+                break
 
-    # Solve the scaled system
-    x_scaled = np.linalg.solve(A, b[..., np.newaxis])[..., 0]  # (H, W, 5)
+        h_prev = h.copy()
 
-    # Unscale the solution
-    x = x_scaled / col_norms  # (H, W, 5)
+        # Update parallax vectors in H_matrix for next iteration
+        if can_iterate and iteration < actual_iters - 1:
+            h_clipped = np.clip(np.where(np.isfinite(h), h, 0.0), 0.0, 20000.0)
+            w_u_new, w_v_new = compute_parallax_vectors_at_h(
+                sat_a, sat_b, h_clipped,
+            )
+            H_matrix[:, :, 4, 0] = w_u_new
+            H_matrix[:, :, 5, 0] = w_v_new
+            H_matrix[:, :, 6, 0] = w_u_new
+            H_matrix[:, :, 7, 0] = w_v_new
 
     # Extract state variables
     h = x[:, :, 0]
@@ -228,27 +360,6 @@ def solve_stereo_winds(
     p_v = x[:, :, 2]
     V_u = x[:, :, 3]
     V_v = x[:, :, 4]
-
-    # Residuals
-    y_pred = np.einsum("...ij,...j->...i", H, x)  # (H, W, 8)
-    residual = y - y_pred
-    weighted_resid_sq = (residual**2) * W
-    chi2 = np.sum(weighted_resid_sq, axis=-1)  # (H, W), DOF = 8 - 5 = 3
-
-    # Formal uncertainties from covariance: C = D^{-1} A_s^{-1} D^{-1}
-    # where D = diag(col_norms) and A_s is the scaled normal matrix
-    try:
-        C_scaled = np.linalg.inv(A)  # (H, W, 5, 5)
-        # Unscale: C[i,j] = C_scaled[i,j] / (col_norms[i] * col_norms[j])
-        inv_norms = 1.0 / col_norms
-        C = C_scaled * inv_norms[:, :, :, np.newaxis] * inv_norms[:, :, np.newaxis, :]
-        sigma_h = np.sqrt(np.maximum(C[:, :, 0, 0], 0.0))
-        sigma_u = np.sqrt(np.maximum(C[:, :, 3, 3], 0.0))
-        sigma_v = np.sqrt(np.maximum(C[:, :, 4, 4], 0.0))
-    except np.linalg.LinAlgError:
-        sigma_h = np.full((H_px, W_px), np.nan)
-        sigma_u = np.full((H_px, W_px), np.nan)
-        sigma_v = np.full((H_px, W_px), np.nan)
 
     # Quality flags
     quality_flag = np.ones((H_px, W_px), dtype=np.float64)
@@ -267,7 +378,84 @@ def solve_stereo_winds(
         "sigma_u": sigma_u,
         "sigma_v": sigma_v,
         "quality_flag": quality_flag,
+        "delta_h_history": delta_h_history,
     }
+
+
+def estimate_cross_sat_offset(
+    disparities: dict[str, np.ndarray],
+    w_u: np.ndarray,
+    w_v: np.ndarray,
+    temporal_motion_threshold: float = 1.0,
+    sigma: float = 200.0,
+) -> tuple[float, float]:
+    """Estimate systematic RAFT offset in cross-satellite flows.
+
+    At clear-sky pixels (low temporal motion, h ≈ 0), the measured parallax
+    (cross-sat minus temporal) should be zero. Any non-zero residual is a
+    systematic RAFT offset that biases height estimates.
+
+    Parameters
+    ----------
+    disparities : dict with keys D1..D4, each (2, H, W)
+    w_u, w_v : parallax sensitivity arrays
+    temporal_motion_threshold : max temporal flow magnitude for "clear sky"
+    sigma : Gaussian smoothing sigma (not used, kept for future spatial field)
+
+    Returns
+    -------
+    offset_u, offset_v : scalar offsets to subtract from D3/D4
+    """
+    D1, D2, D3, D4 = (disparities[k] for k in ["D1", "D2", "D3", "D4"])
+
+    # Temporal motion magnitude as cloud proxy
+    temporal_mag = np.sqrt(D1[0]**2 + D1[1]**2 + D2[0]**2 + D2[1]**2)
+
+    # Measured parallax = mean cross-sat minus mean temporal
+    par_u = ((D3[0] + D4[0]) / 2) - ((D1[0] + D2[0]) / 2)
+    par_v = ((D3[1] + D4[1]) / 2) - ((D1[1] + D2[1]) / 2)
+
+    valid = (
+        np.isfinite(par_u) & np.isfinite(par_v)
+        & np.isfinite(temporal_mag)
+        & (np.abs(w_u) > 1e-7)
+    )
+    clear_sky = valid & (temporal_mag < temporal_motion_threshold)
+
+    n_clear = int(clear_sky.sum())
+    if n_clear < 100:
+        return 0.0, 0.0
+
+    offset_u = float(np.median(par_u[clear_sky]))
+    offset_v = float(np.median(par_v[clear_sky]))
+
+    return offset_u, offset_v
+
+
+def correct_cross_sat_offset(
+    disparities: dict[str, np.ndarray],
+    offset_u: float,
+    offset_v: float,
+) -> dict[str, np.ndarray]:
+    """Subtract systematic offset from cross-satellite flows D3 and D4.
+
+    Returns a new disparities dict with corrected D3/D4 (D1/D2 unchanged).
+    """
+    corrected = {}
+    corrected["D1"] = disparities["D1"]
+    corrected["D2"] = disparities["D2"]
+
+    D3_corr = disparities["D3"].copy()
+    D4_corr = disparities["D4"].copy()
+    D3_corr[0] = D3_corr[0] - offset_u
+    D3_corr[1] = D3_corr[1] - offset_v
+    D4_corr[0] = D4_corr[0] - offset_u
+    D4_corr[1] = D4_corr[1] - offset_v
+
+    corrected["D3"] = D3_corr
+    corrected["D4"] = D4_corr
+
+    return corrected
 
 
 def pixels_to_wind_ms(

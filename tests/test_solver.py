@@ -7,6 +7,7 @@ from stereo_winds.config import GOES16_CONFIG, GOES18_CONFIG
 from stereo_winds.solver import (
     build_design_matrix,
     compute_parallax_vectors,
+    compute_parallax_vectors_at_h,
     pixels_to_wind_ms,
     solve_stereo_winds,
 )
@@ -203,3 +204,120 @@ class TestPixelsToWindMs:
         # So 1 pixel / 600s ≈ 3.3 m/s
         assert 2.0 < abs(u[0]) < 5.0
         assert 2.0 < abs(v[0]) < 5.0
+
+    def test_v_sign_convention(self):
+        """Positive V_v should give positive v_ms (consistent with solver sign convention)."""
+        u, v = pixels_to_wind_ms(
+            np.array([0.0]), np.array([1.0]),
+            GOES16_CONFIG, dt_seconds=600.0,
+        )
+        assert v[0] > 0, f"v_ms should be positive for positive V_v, got {v[0]}"
+
+
+def _make_small_sats(n=8):
+    """Create small test satellite configs for fast parallax tests."""
+    from stereo_winds.config import SatelliteConfig
+    scale_factor = 5424 / n
+    sat_a = SatelliteConfig(
+        satellite_id="test_a", sub_lon_deg=-75.0, n_rows=n, n_cols=n,
+        scale_x=GOES16_CONFIG.scale_x * scale_factor,
+        scale_y=GOES16_CONFIG.scale_y * scale_factor,
+        x_offset=GOES16_CONFIG.x_offset,
+        y_offset=GOES16_CONFIG.y_offset,
+    )
+    sat_b = SatelliteConfig(
+        satellite_id="test_b", sub_lon_deg=-137.0, n_rows=n, n_cols=n,
+        scale_x=GOES18_CONFIG.scale_x * scale_factor,
+        scale_y=GOES18_CONFIG.scale_y * scale_factor,
+        x_offset=GOES18_CONFIG.x_offset,
+        y_offset=GOES18_CONFIG.y_offset,
+    )
+    return sat_a, sat_b
+
+
+class TestComputeParallaxVectorsAtH:
+    """Test height-dependent parallax computation."""
+
+    def test_shape(self):
+        sat_a, sat_b = _make_small_sats(8)
+        w_u, w_v = compute_parallax_vectors_at_h(sat_a, sat_b, h_m=5000.0)
+        assert w_u.shape == (8, 8)
+        assert w_v.shape == (8, 8)
+
+    def test_h0_matches_original(self):
+        """At h=0, should match compute_parallax_vectors."""
+        sat_a, sat_b = _make_small_sats(8)
+        w_u_orig, w_v_orig = compute_parallax_vectors(sat_a, sat_b)
+        w_u_at0, w_v_at0 = compute_parallax_vectors_at_h(sat_a, sat_b, h_m=0.0)
+        np.testing.assert_allclose(w_u_at0, w_u_orig, atol=1e-10)
+        np.testing.assert_allclose(w_v_at0, w_v_orig, atol=1e-10)
+
+    def test_differs_from_h0(self):
+        """Parallax at h=10000 should differ from h=0."""
+        sat_a, sat_b = _make_small_sats(8)
+        w_u_0, w_v_0 = compute_parallax_vectors(sat_a, sat_b)
+        w_u_h, w_v_h = compute_parallax_vectors_at_h(sat_a, sat_b, h_m=10000.0)
+        valid = np.isfinite(w_u_0) & np.isfinite(w_u_h)
+        if valid.sum() > 0:
+            diff = np.abs(w_u_h[valid] - w_u_0[valid])
+            assert np.max(diff) > 0, "Parallax should change with height"
+
+    def test_per_pixel_h(self):
+        """Should accept a per-pixel height array."""
+        sat_a, sat_b = _make_small_sats(8)
+        h_map = np.random.default_rng(0).uniform(0, 15000, (8, 8))
+        w_u, w_v = compute_parallax_vectors_at_h(sat_a, sat_b, h_m=h_map)
+        assert w_u.shape == (8, 8)
+
+
+class TestSolveStereoWindsIterative:
+    """Test iterative nonlinear solve."""
+
+    def test_delta_h_history_empty_for_single_iter(self):
+        """n_iter=1 should return empty delta_h_history."""
+        n = 4
+        w_u = np.full((n, n), 0.001)
+        w_v = np.full((n, n), 0.0003)
+        H_mat = build_design_matrix(w_u, w_v, -600.0, 600.0, -600.0, 600.0)
+        x_true = np.array([8000.0, 0.5, -0.2, 5.0, -3.0])
+        y = np.einsum("...ij,...j->...i", H_mat, x_true)
+        disparities = {
+            f"D{i+1}": np.stack([y[:, :, 2*i], y[:, :, 2*i+1]])
+            for i in range(4)
+        }
+        sol = solve_stereo_winds(disparities, H_mat)
+        assert sol["delta_h_history"] == []
+
+    def test_iterative_noop_when_no_sats(self):
+        """n_iter>1 without sat configs falls back to single solve."""
+        n = 4
+        w_u = np.full((n, n), 0.001)
+        w_v = np.full((n, n), 0.0003)
+        H_mat = build_design_matrix(w_u, w_v, -600.0, 600.0, -600.0, 600.0)
+        x_true = np.array([8000.0, 0.5, -0.2, 5.0, -3.0])
+        y = np.einsum("...ij,...j->...i", H_mat, x_true)
+        disparities = {
+            f"D{i+1}": np.stack([y[:, :, 2*i], y[:, :, 2*i+1]])
+            for i in range(4)
+        }
+        sol = solve_stereo_winds(disparities, H_mat, n_iter=3)
+        assert sol["delta_h_history"] == []
+        np.testing.assert_allclose(sol["h"], 8000.0, atol=1.0)
+
+    def test_iterative_converges(self):
+        """With real sat configs, iteration should produce delta_h_history."""
+        sat_a, sat_b = _make_small_sats(8)
+        w_u, w_v = compute_parallax_vectors(sat_a, sat_b)
+        H_mat = build_design_matrix(w_u, w_v, -600.0, 600.0, -600.0, 600.0)
+
+        x_true = np.array([10000.0, 0.3, -0.1, 2.0, -1.0])
+        y = np.einsum("...ij,...j->...i", H_mat, x_true)
+        disparities = {
+            f"D{i+1}": np.stack([y[:, :, 2*i], y[:, :, 2*i+1]])
+            for i in range(4)
+        }
+        sol = solve_stereo_winds(
+            disparities, H_mat, sat_a=sat_a, sat_b=sat_b, n_iter=3,
+        )
+        # Should have at least 1 entry in delta_h_history (from iter 1 vs 0)
+        assert len(sol["delta_h_history"]) >= 1

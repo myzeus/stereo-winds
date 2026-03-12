@@ -58,8 +58,10 @@ class StereoDisparity:
         # FlowRunner expects (1, 1, H, W) — batch, channels, height, width
         i1 = img1[np.newaxis, np.newaxis, :, :]
         i2 = img2[np.newaxis, np.newaxis, :, :]
-        return self.runner.forward(i1, i2)
+        flows = self.runner.forward(i1, i2)
+        return flows
 
+    
     def compute_all(
         self,
         images: dict[str, np.ndarray],
