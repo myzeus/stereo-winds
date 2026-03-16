@@ -102,6 +102,49 @@ class StereoWindPipeline:
             )
         return self._disparity_engine
 
+    def _flow_cache_path(self, t0: datetime, band: str, key: str, sat_a_id: str, sat_b_id: str) -> Path:
+        """Path for a cached flow file."""
+        flow_dir = self.config.cache_dir / f"{t0:%Y%m%d}"
+        return flow_dir / f"flow_{sat_a_id}_{sat_b_id}_{t0:%H%Mz}_{band}_{key}.npy"
+
+    def _load_or_compute_flows(
+        self, images: dict[str, np.ndarray], t0: datetime, band: str, sat_a_id: str, sat_b_id: str,
+    ) -> dict[str, np.ndarray]:
+        """Load cached flows or compute with RAFT."""
+        # Check cache
+        cached = {}
+        for key in ["D1", "D2", "D3", "D4"]:
+            p = self._flow_cache_path(t0, band, key, sat_a_id, sat_b_id)
+            if p.exists():
+                cached[key] = np.load(str(p))
+                if cached[key].ndim == 4:
+                    cached[key] = cached[key][0]
+
+        if len(cached) == 4:
+            logger.info("Loaded all 4 flows from cache")
+            return cached
+
+        # Compute with RAFT
+        logger.info("Computing disparity fields (4 pairs)...")
+        engine = self._get_disparity_engine()
+        disparities = engine.compute_all(images)
+
+        # Mask invalid pixels
+        valid = np.ones(images["A0"].shape, dtype=bool)
+        for name in images:
+            valid &= np.isfinite(images[name])
+        for key in disparities:
+            disparities[key][:, ~valid] = np.nan
+
+        # Cache flows
+        for key in ["D1", "D2", "D3", "D4"]:
+            p = self._flow_cache_path(t0, band, key, sat_a_id, sat_b_id)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            np.save(str(p), disparities[key])
+        logger.info("Saved flows to cache")
+
+        return disparities
+
     def run(self, t0: datetime) -> xr.Dataset:
         """Run the full stereo wind retrieval for a single timestep.
 
@@ -126,14 +169,17 @@ class StereoWindPipeline:
                 sat_b_id=cfg.sat_b.satellite_id,
                 band_a=cfg.band,
                 cache_dir=cfg.cache_dir,
+                product=cfg.product,
             )
         except FileNotFoundError as e:
             logger.warning("B satellite data missing: %s. Falling back to temporal-only.", e)
             return self._run_temporal_only(t0)
 
-        # Use actual satellite configs from file metadata
-        sat_a = scenes["A0"][1]
-        sat_b = scenes["B_minus"][1]
+        # Use canonical satellite configs for geometry (remap, parallax).
+        # Runtime configs from satpy may have slightly different offsets
+        # which cause remap LUT shifts that inflate height errors.
+        sat_a = cfg.sat_a
+        sat_b = cfg.sat_b
 
         # 2. Remap B scenes to A's grid
         logger.info("Step 2: Remapping B scenes to A's grid...")
@@ -147,10 +193,11 @@ class StereoWindPipeline:
             "B_plus": remap_image(scenes["B_plus"][0], col_b, row_b),
         }
 
-        # 3. Run RAFT on 4 pairs
-        logger.info("Step 3: Computing disparity fields (4 pairs)...")
-        engine = self._get_disparity_engine()
-        disparities = engine.compute_all(images)
+        # 3. Run RAFT on 4 pairs (with caching)
+        logger.info("Step 3: Disparity fields...")
+        disparities = self._load_or_compute_flows(
+            images, t0, cfg.band, sat_a.satellite_id, sat_b.satellite_id,
+        )
 
         # 4. Build design matrix from parallax vectors + time offsets
         logger.info("Step 4: Building design matrix...")
@@ -164,14 +211,19 @@ class StereoWindPipeline:
             dt_b_plus=scene_times["B_plus"],
         )
 
-        # 5. Solve 5-state WLS
-        logger.info("Step 5: Solving 5-state system...")
-        solution = solve_stereo_winds(disparities, H_matrix)
+        # 5. Solve 5-state WLS (iterative)
+        logger.info("Step 5: Solving 5-state system (n_iter=%d)...", cfg.n_iter)
+        solution = solve_stereo_winds(
+            disparities, H_matrix,
+            sat_a=sat_a, sat_b=sat_b, n_iter=cfg.n_iter,
+            device=cfg.device,
+        )
 
         # 6. Convert to m/s, apply QC flags
+        # V_u, V_v are in pixels/second (design matrix has dt in seconds),
+        # so dt_seconds=1.0 for the unit conversion.
         logger.info("Step 6: Converting to physical units and applying QC...")
-        dt_seconds = cfg.dt_minutes * 60.0
-        u_ms, v_ms = pixels_to_wind_ms(solution["V_u"], solution["V_v"], sat_a, dt_seconds)
+        u_ms, v_ms = pixels_to_wind_ms(solution["V_u"], solution["V_v"], sat_a, dt_seconds=1.0)
         solution["u_wind"] = u_ms
         solution["v_wind"] = v_ms
 
@@ -187,6 +239,7 @@ class StereoWindPipeline:
         ds = create_output_dataset(solution, sat_a, t0, cfg)
 
         output_path = cfg.output_dir / f"stereo_winds_{t0:%Y%m%d_%H%M}.nc"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         write_netcdf(ds, output_path)
         logger.info("Output written to %s", output_path)
 
@@ -208,6 +261,7 @@ class StereoWindPipeline:
             sat_b_id=cfg.sat_a.satellite_id,  # Both from A
             band_a=cfg.band,
             cache_dir=cfg.cache_dir,
+            product=cfg.product,
         )
 
         sat_a = scenes["A0"][1]
@@ -223,12 +277,13 @@ class StereoWindPipeline:
         d1 = engine._run_pair(images["A0"], images["A_minus"])
         d2 = engine._run_pair(images["A0"], images["A_plus"])
 
-        # Simple average for velocity
+        # Simple average for velocity (pixels per dt_seconds)
         dt_seconds = cfg.dt_minutes * 60.0
-        V_u = (d2[0] - d1[0]) / 2.0
-        V_v = (d2[1] - d1[1]) / 2.0
+        V_u = (d2[0] - d1[0]) / (2.0 * dt_seconds)
+        V_v = (d2[1] - d1[1]) / (2.0 * dt_seconds)
 
-        u_ms, v_ms = pixels_to_wind_ms(V_u, V_v, sat_a, dt_seconds)
+        # V_u, V_v are now in pixels/second
+        u_ms, v_ms = pixels_to_wind_ms(V_u, V_v, sat_a, dt_seconds=1.0)
 
         n_rows, n_cols = sat_a.n_rows, sat_a.n_cols
         solution = {
@@ -250,6 +305,7 @@ class StereoWindPipeline:
         ds.attrs["retrieval_mode"] = "temporal_only"
 
         output_path = cfg.output_dir / f"stereo_winds_temporal_{t0:%Y%m%d_%H%M}.nc"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         write_netcdf(ds, output_path)
         logger.info("Temporal-only output written to %s", output_path)
 

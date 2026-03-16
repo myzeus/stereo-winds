@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import glob as _glob
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -66,10 +67,30 @@ HIMAWARI8_CONFIG = SatelliteConfig(
     n_cols=5500,
 )
 
+GOES19_CONFIG = SatelliteConfig(
+    satellite_id="goes19",
+    sub_lon_deg=-75.0,
+    sweep="x",
+)
+
+HIMAWARI9_CONFIG = SatelliteConfig(
+    satellite_id="himawari9",
+    sub_lon_deg=140.7,
+    sweep="y",
+    scale_x=5.6e-05,
+    scale_y=-5.6e-05,
+    x_offset=-0.153719,
+    y_offset=0.153719,
+    n_rows=5500,
+    n_cols=5500,
+)
+
 SATELLITE_CONFIGS = {
     "goes16": GOES16_CONFIG,
     "goes18": GOES18_CONFIG,
+    "goes19": GOES19_CONFIG,
     "himawari8": HIMAWARI8_CONFIG,
+    "himawari9": HIMAWARI9_CONFIG,
 }
 
 
@@ -85,14 +106,64 @@ class StereoPairConfig:
     # RAFT model settings
     model_ckpt_path: str = ""
     tile_size: int = 512
-    overlap: int = 256
+    overlap: int = 128
     batch_size: int = 8
-    device: str = "cpu"
+    device: str = "gpu"
+
+    # Solver settings
+    n_iter: int = 3
+    product: str = "ABI-L1b-RadF"
 
     # Output paths
     output_dir: Path = field(default_factory=lambda: Path("output"))
     cache_dir: Path = field(default_factory=lambda: Path("cache"))
 
     # Quality control
-    max_zenith_angle: float = 70.0
+    max_zenith_angle: float = 80.0
     chi2_threshold: float = 10.0
+
+    @classmethod
+    def from_satellites(
+        cls,
+        sat_a: str,
+        sat_b: str,
+        band: str = "C14",
+        **kwargs,
+    ) -> "StereoPairConfig":
+        """Create a config from satellite ID strings.
+
+        Looks up satellite configs from the registry and auto-finds
+        the RAFT checkpoint in the zeus weights directory.
+
+        Parameters
+        ----------
+        sat_a, sat_b : satellite identifiers (e.g., "goes19", "goes18")
+        band : ABI/AHI band name (e.g., "C14", "B14")
+        **kwargs : override any StereoPairConfig field
+        """
+        if sat_a not in SATELLITE_CONFIGS:
+            raise ValueError(f"Unknown satellite '{sat_a}'. Known: {list(SATELLITE_CONFIGS)}")
+        if sat_b not in SATELLITE_CONFIGS:
+            raise ValueError(f"Unknown satellite '{sat_b}'. Known: {list(SATELLITE_CONFIGS)}")
+
+        # Auto-find RAFT checkpoint if not provided
+        if "model_ckpt_path" not in kwargs or not kwargs["model_ckpt_path"]:
+            zeus_weights = Path(__file__).resolve().parent.parent / "zeus" / "zeus" / "networks" / "weights"
+            ckpts = sorted(_glob.glob(str(zeus_weights / "raft-128.*.ckpt")))
+            if ckpts:
+                kwargs["model_ckpt_path"] = ckpts[-1]  # latest
+            else:
+                raise FileNotFoundError(
+                    f"No RAFT checkpoint found in {zeus_weights}. "
+                    "Pass model_ckpt_path explicitly."
+                )
+
+        defaults = dict(
+            sat_a=SATELLITE_CONFIGS[sat_a],
+            sat_b=SATELLITE_CONFIGS[sat_b],
+            band=band,
+            device="cuda",
+            cache_dir=Path("cache"),
+        )
+        defaults.update(kwargs)
+        return cls(**defaults)

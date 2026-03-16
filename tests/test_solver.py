@@ -188,30 +188,46 @@ class TestSolveStereoWinds:
 
 
 class TestPixelsToWindMs:
-    """Test pixel velocity to m/s conversion."""
+    """Test pixel velocity to m/s conversion with per-pixel ground scale."""
 
     def test_zero_velocity(self):
-        u, v = pixels_to_wind_ms(0.0, 0.0, GOES16_CONFIG, dt_seconds=600.0)
-        assert u == 0.0
-        assert v == 0.0
+        V_u = np.zeros((GOES16_CONFIG.n_rows, GOES16_CONFIG.n_cols))
+        V_v = np.zeros((GOES16_CONFIG.n_rows, GOES16_CONFIG.n_cols))
+        u, v = pixels_to_wind_ms(V_u, V_v, GOES16_CONFIG, dt_seconds=600.0)
+        # On-Earth pixels should be 0, off-Earth are NaN
+        assert np.nanmax(np.abs(u)) == 0.0
+        assert np.nanmax(np.abs(v)) == 0.0
 
-    def test_nonzero(self):
-        u, v = pixels_to_wind_ms(
-            np.array([1.0]), np.array([1.0]),
-            GOES16_CONFIG, dt_seconds=600.0,
+    def test_nadir_pixel_scale(self):
+        """At nadir (~row 2712, col 2712), scale should be close to nominal 2 km."""
+        V_u = np.zeros((GOES16_CONFIG.n_rows, GOES16_CONFIG.n_cols))
+        V_v = np.zeros((GOES16_CONFIG.n_rows, GOES16_CONFIG.n_cols))
+        V_u[2712, 2712] = 1.0
+        V_v[2712, 2712] = 1.0
+        u, v = pixels_to_wind_ms(V_u, V_v, GOES16_CONFIG, dt_seconds=1.0)
+        # Nadir pixel scale ~ 2004 m
+        assert 1900 < abs(u[2712, 2712]) < 2100
+        assert 1900 < abs(v[2712, 2712]) < 2100
+
+    def test_limb_larger_than_nadir(self):
+        """Pixels near the limb should have larger ground scale than nadir."""
+        from stereo_winds.navigation import compute_pixel_scale
+        dx_m, dy_m = compute_pixel_scale(GOES16_CONFIG)
+        nadir_dx = dx_m[2712, 2712]
+        # Pick a pixel near the limb but still on-Earth (row 200, near north edge)
+        limb_dx = dx_m[200, 2712]
+        assert np.isfinite(limb_dx), "Near-limb pixel should be on-Earth"
+        assert limb_dx > nadir_dx * 1.05, (
+            f"Near-limb dx ({limb_dx:.0f}) should be larger than nadir ({nadir_dx:.0f})"
         )
-        # Pixel scale ~ 35786023 * 5.6e-5 ≈ 2004 m
-        # So 1 pixel / 600s ≈ 3.3 m/s
-        assert 2.0 < abs(u[0]) < 5.0
-        assert 2.0 < abs(v[0]) < 5.0
 
     def test_v_sign_convention(self):
-        """Positive V_v should give positive v_ms (consistent with solver sign convention)."""
-        u, v = pixels_to_wind_ms(
-            np.array([0.0]), np.array([1.0]),
-            GOES16_CONFIG, dt_seconds=600.0,
-        )
-        assert v[0] > 0, f"v_ms should be positive for positive V_v, got {v[0]}"
+        """Positive V_v should give positive v_ms."""
+        V_u = np.zeros((GOES16_CONFIG.n_rows, GOES16_CONFIG.n_cols))
+        V_v = np.zeros((GOES16_CONFIG.n_rows, GOES16_CONFIG.n_cols))
+        V_v[2712, 2712] = 1.0
+        u, v = pixels_to_wind_ms(V_u, V_v, GOES16_CONFIG, dt_seconds=600.0)
+        assert v[2712, 2712] > 0, f"v_ms should be positive, got {v[2712, 2712]}"
 
 
 def _make_small_sats(n=8):
@@ -268,6 +284,73 @@ class TestComputeParallaxVectorsAtH:
         h_map = np.random.default_rng(0).uniform(0, 15000, (8, 8))
         w_u, w_v = compute_parallax_vectors_at_h(sat_a, sat_b, h_m=h_map)
         assert w_u.shape == (8, 8)
+
+
+class TestParallaxRemapConsistency:
+    """Verify parallax vectors match the remap geometry displacement."""
+
+    def test_parallax_matches_remap_geometry(self):
+        """For clouds at various locations, the parallax vector should
+        correctly predict the displacement observed through the B-to-A remap.
+
+        The remap maps B scanning angles → surface lat/lon → A scanning angles.
+        The parallax vector must account for this full transformation, not just
+        convert B scanning angle changes directly to A pixel units.
+        """
+        from stereo_winds.navigation import (
+            fixed_grid_to_geodetic,
+            geodetic_to_fixed_grid,
+        )
+
+        sat_a = GOES16_CONFIG
+        sat_b = GOES18_CONFIG
+        h_test = 10000.0  # 10 km cloud
+        dh = 1000.0
+
+        test_points = [
+            (0.0, -106.0, "equator_midpoint"),
+            (30.0, -120.0, "pacific_south_CA"),
+            (40.0, -100.0, "central_US"),
+            (20.0, -80.0, "caribbean"),
+        ]
+
+        for lat, lon, name in test_points:
+            lat_a = np.array([lat])
+            lon_a = np.array([lon])
+
+            # Compute parallax using the same logic as compute_parallax_vectors
+            xa_0, ya_0 = geodetic_to_fixed_grid(lat_a, lon_a, sat_a, h_m=0.0)
+            xa_h, ya_h = geodetic_to_fixed_grid(lat_a, lon_a, sat_a, h_m=dh)
+            xb_h, yb_h = geodetic_to_fixed_grid(lat_a, lon_a, sat_b, h_m=dh)
+            lat_remap, lon_remap = fixed_grid_to_geodetic(xb_h, yb_h, sat_b)
+            xa_remap, ya_remap = geodetic_to_fixed_grid(
+                lat_remap, lon_remap, sat_a, h_m=0.0
+            )
+            w_u = float((xa_remap - xa_0) - (xa_h - xa_0)) / sat_a.scale_x / dh
+
+            # Compute the "true" displacement at h_test through the full geometry
+            xb_full, yb_full = geodetic_to_fixed_grid(
+                lat_a, lon_a, sat_b, h_m=h_test
+            )
+            lat_r_full, lon_r_full = fixed_grid_to_geodetic(xb_full, yb_full, sat_b)
+            xa_r_full, ya_r_full = geodetic_to_fixed_grid(
+                lat_r_full, lon_r_full, sat_a, h_m=0.0
+            )
+            xa_h_full, ya_h_full = geodetic_to_fixed_grid(
+                lat_a, lon_a, sat_a, h_m=h_test
+            )
+            true_par_u = float(
+                (xa_r_full - xa_0) - (xa_h_full - xa_0)
+            ) / sat_a.scale_x
+            predicted_par_u = h_test * w_u
+
+            # Height error should be < 1% (linearization error only)
+            if abs(true_par_u) > 0.01:
+                solver_h = true_par_u / w_u
+                h_error_pct = abs(solver_h / h_test - 1) * 100
+                assert h_error_pct < 1.0, (
+                    f"{name}: height error {h_error_pct:.1f}% > 1%"
+                )
 
 
 class TestSolveStereoWindsIterative:

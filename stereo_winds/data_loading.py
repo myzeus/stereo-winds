@@ -82,7 +82,10 @@ def load_native_abi(
     data : (n_rows, n_cols) float32 array of radiance values
     sat_config : SatelliteConfig populated from file metadata
     """
-    ds = xr.open_dataset(str(nc_path), engine="h5netcdf")
+    try:
+        ds = xr.open_dataset(str(nc_path), engine="h5netcdf")
+    except Exception:
+        ds = xr.open_dataset(str(nc_path), engine="netcdf4")
     try:
         data = ds["Rad"].values.astype(np.float32)
         sat_config = _sat_config_from_nc(ds, satellite_id)
@@ -270,6 +273,7 @@ def load_stereo_scenes(
     band_a: str = "C14",
     band_b: str | None = None,
     cache_dir: str | Path | None = None,
+    product: str = "ABI-L1b-RadF",
 ) -> dict[str, tuple[np.ndarray, SatelliteConfig]]:
     """Load all 5 scenes for a stereo retrieval.
 
@@ -283,6 +287,7 @@ def load_stereo_scenes(
     band_a : band for satellite A
     band_b : band for satellite B (defaults to band_a)
     cache_dir : local cache directory
+    product : ABI product type (e.g., "ABI-L1b-RadF")
 
     Returns dict mapping scene name to (data_2d, SatelliteConfig).
     """
@@ -305,15 +310,16 @@ def load_stereo_scenes(
         band = band_b if is_sat_b else band_a
 
         if "goes" in sat_id:
-            data, config = load_goes_scene(t, band, sat_id, cache_dir)
-        else:
-            # AHI: download then load natively
+            data, config = load_goes_scene(t, band, sat_id, cache_dir, product=product)
+        elif "himawari" in sat_id:
             files = download_ahi(t, band, sat_id, cache_dir)
             if not files:
                 raise FileNotFoundError(
                     f"No data found for {sat_id} at {t} band {band}"
                 )
             data, config = load_native_abi(files[0], sat_id)
+        else:
+            raise ValueError(f"Unknown satellite type: {sat_id}")
 
         scenes[name] = (data, config)
 

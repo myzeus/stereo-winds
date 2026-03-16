@@ -9,9 +9,44 @@ Computes 4 disparity fields from 5 input scenes:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+def _ensure_compat_checkpoint(ckpt_path: str) -> str:
+    """Convert PyTorch Lightning checkpoint to FlowRunner format if needed.
+
+    FlowRunner expects {"model": state_dict, "global_step": int}.
+    PL checkpoints have {"state_dict": ..., "global_step": ...}.
+    Returns the path to the compatible checkpoint.
+    """
+    import torch
+
+    ckpt_path = str(ckpt_path)
+    data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+
+    # Already in compat format
+    if "model" in data:
+        return ckpt_path
+
+    # PL format — convert and save alongside
+    if "state_dict" in data:
+        compat_path = ckpt_path.rsplit(".", 1)[0] + "_compat.pt"
+        p = Path(compat_path)
+        if not p.exists():
+            logger.info("Converting PL checkpoint to FlowRunner format: %s", p.name)
+            torch.save(
+                {"model": data["state_dict"], "global_step": data.get("global_step", 0)},
+                compat_path,
+            )
+        return compat_path
+
+    # Unknown format — pass through and let FlowRunner handle it
+    return ckpt_path
 
 
 class StereoDisparity:
@@ -19,7 +54,7 @@ class StereoDisparity:
 
     Parameters
     ----------
-    model_ckpt_path : path to RAFT checkpoint
+    model_ckpt_path : path to RAFT checkpoint (PL or FlowRunner format)
     tile_size, overlap, batch_size, device : FlowRunner settings
     """
 
@@ -35,8 +70,10 @@ class StereoDisparity:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "zeus"))
         from zeus.inference.inference_flows import FlowRunner
 
+        compat_path = _ensure_compat_checkpoint(model_ckpt_path)
+
         self.runner = FlowRunner(
-            model_ckpt_path=model_ckpt_path,
+            model_ckpt_path=compat_path,
             model_name="raft",
             tile_size=tile_size,
             overlap=overlap,
@@ -54,14 +91,23 @@ class StereoDisparity:
         Returns
         -------
         flow : (2, H, W) pixel displacements (du, dv)
+            v-component is negated so that positive = northward,
+            matching the solver convention (RAFT uses positive-down).
         """
         # FlowRunner expects (1, 1, H, W) — batch, channels, height, width
         i1 = img1[np.newaxis, np.newaxis, :, :]
         i2 = img2[np.newaxis, np.newaxis, :, :]
-        flows = self.runner.forward(i1, i2)
-        return flows
+        flow = self.runner.forward(i1, i2)
 
-    
+        # Squeeze batch dimension if present
+        if flow.ndim == 4:
+            flow = flow[0]
+
+        # Negate v-component: RAFT positive-down → solver positive-north
+        flow[1] = -flow[1]
+
+        return flow
+
     def compute_all(
         self,
         images: dict[str, np.ndarray],
@@ -78,6 +124,7 @@ class StereoDisparity:
         -------
         disparities : dict with keys D1, D2, D3, D4
             Each value is (2, H, W) pixel displacement array.
+            v-component is positive-north (solver convention).
         """
         a0 = images["A0"]
 

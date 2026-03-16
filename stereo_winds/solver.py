@@ -56,20 +56,23 @@ def compute_parallax_vectors(
     x_a, y_a = pixel_to_scanning_angle(col_grid, row_grid, sat_a)
     lat, lon = fixed_grid_to_geodetic(x_a, y_a, sat_a)
 
-    # Project (lat, lon, 0) and (lat, lon, dh) into B's grid
-    xb_0, yb_0 = geodetic_to_fixed_grid(lat, lon, sat_b, h_m=0.0)
-    xb_h, yb_h = geodetic_to_fixed_grid(lat, lon, sat_b, h_m=dh)
-
-    # Convert B scanning angles to A pixel coordinates via the remap LUT
-    # Actually, we want the displacement in A's pixel space.
-    # Project into A's grid at h=0 and h=dh, then difference with B.
+    # A's scanning angles at h=0 and h=dh
     xa_0, ya_0 = geodetic_to_fixed_grid(lat, lon, sat_a, h_m=0.0)
     xa_h, ya_h = geodetic_to_fixed_grid(lat, lon, sat_a, h_m=dh)
 
-    # Parallax in scanning angles: displacement in B minus displacement in A
-    # (what the solver sees as additional displacement from height)
-    par_x = (xb_h - xb_0) - (xa_h - xa_0)
-    par_y = (yb_h - yb_0) - (ya_h - ya_0)
+    # B's scanning angles at h=dh — the cloud's apparent position in B
+    xb_h, yb_h = geodetic_to_fixed_grid(lat, lon, sat_b, h_m=dh)
+
+    # Map B's view of the cloud back through the remap geometry:
+    # B scanning angles → surface lat/lon (inverse B) → A scanning angles
+    # This gives the displacement the cloud would have in A's pixel grid
+    # after B-to-A remapping at h=0.
+    lat_remap, lon_remap = fixed_grid_to_geodetic(xb_h, yb_h, sat_b)
+    xa_remap, ya_remap = geodetic_to_fixed_grid(lat_remap, lon_remap, sat_a, h_m=0.0)
+
+    # Parallax = (B-induced displacement in A pixel space) - (A displacement)
+    par_x = (xa_remap - xa_0) - (xa_h - xa_0)
+    par_y = (ya_remap - ya_0) - (ya_h - ya_0)
 
     # Convert from scanning angle difference to pixel difference
     # Δpixel = Δangle / scale
@@ -79,11 +82,29 @@ def compute_parallax_vectors(
     return w_u, w_v
 
 
+def _precompute_latlon(sat_a: SatelliteConfig) -> tuple[np.ndarray, np.ndarray]:
+    """Precompute lat/lon grid for sat_a (cached)."""
+    cache_key = f"{sat_a.satellite_id}_{sat_a.n_rows}_{sat_a.n_cols}"
+    if not hasattr(_precompute_latlon, "_cache"):
+        _precompute_latlon._cache = {}
+    if cache_key in _precompute_latlon._cache:
+        return _precompute_latlon._cache[cache_key]
+
+    rows = np.arange(sat_a.n_rows)
+    cols = np.arange(sat_a.n_cols)
+    col_grid, row_grid = np.meshgrid(cols, rows)
+    x_a, y_a = pixel_to_scanning_angle(col_grid, row_grid, sat_a)
+    lat, lon = fixed_grid_to_geodetic(x_a, y_a, sat_a)
+    _precompute_latlon._cache[cache_key] = (lat, lon)
+    return lat, lon
+
+
 def compute_parallax_vectors_at_h(
     sat_a: SatelliteConfig,
     sat_b: SatelliteConfig,
     h_m: np.ndarray | float,
     dh: float = 1000.0,
+    lat_lon: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute per-pixel parallax sensitivity vectors evaluated at height h_m.
 
@@ -98,34 +119,39 @@ def compute_parallax_vectors_at_h(
         Height in meters at which to evaluate the parallax.
     dh : float
         Height perturbation in meters for finite differences.
+    lat_lon : optional precomputed (lat, lon) arrays for sat_a's grid
 
     Returns
     -------
     w_u, w_v : (n_rows, n_cols) arrays
         Parallax sensitivity in pixels per meter of height.
     """
-    rows = np.arange(sat_a.n_rows)
-    cols = np.arange(sat_a.n_cols)
-    col_grid, row_grid = np.meshgrid(cols, rows)
-
-    # Inverse-project A's pixels to (lat, lon) at h = 0
-    # (the pixel grid is defined at h=0; we evaluate parallax at h_m)
-    x_a, y_a = pixel_to_scanning_angle(col_grid, row_grid, sat_a)
-    lat, lon = fixed_grid_to_geodetic(x_a, y_a, sat_a)
+    if lat_lon is not None:
+        lat, lon = lat_lon
+    else:
+        lat, lon = _precompute_latlon(sat_a)
 
     h_m = np.broadcast_to(np.asarray(h_m, dtype=np.float64),
                            (sat_a.n_rows, sat_a.n_cols))
 
-    # Project (lat, lon) at h_m and h_m+dh into both satellites' grids
-    xb_lo, yb_lo = geodetic_to_fixed_grid(lat, lon, sat_b, h_m=h_m)
-    xb_hi, yb_hi = geodetic_to_fixed_grid(lat, lon, sat_b, h_m=h_m + dh)
-
+    # A's scanning angles at h_m and h_m+dh
     xa_lo, ya_lo = geodetic_to_fixed_grid(lat, lon, sat_a, h_m=h_m)
     xa_hi, ya_hi = geodetic_to_fixed_grid(lat, lon, sat_a, h_m=h_m + dh)
 
+    # B's scanning angles at h_m and h_m+dh
+    xb_lo, yb_lo = geodetic_to_fixed_grid(lat, lon, sat_b, h_m=h_m)
+    xb_hi, yb_hi = geodetic_to_fixed_grid(lat, lon, sat_b, h_m=h_m + dh)
+
+    # Map B's view back through remap geometry to A's pixel space
+    lat_remap_lo, lon_remap_lo = fixed_grid_to_geodetic(xb_lo, yb_lo, sat_b)
+    xa_remap_lo, ya_remap_lo = geodetic_to_fixed_grid(lat_remap_lo, lon_remap_lo, sat_a, h_m=0.0)
+
+    lat_remap_hi, lon_remap_hi = fixed_grid_to_geodetic(xb_hi, yb_hi, sat_b)
+    xa_remap_hi, ya_remap_hi = geodetic_to_fixed_grid(lat_remap_hi, lon_remap_hi, sat_a, h_m=0.0)
+
     # Differential parallax at height h_m
-    par_x = (xb_hi - xb_lo) - (xa_hi - xa_lo)
-    par_y = (yb_hi - yb_lo) - (ya_hi - ya_lo)
+    par_x = (xa_remap_hi - xa_remap_lo) - (xa_hi - xa_lo)
+    par_y = (ya_remap_hi - ya_remap_lo) - (ya_hi - ya_lo)
 
     w_u = par_x / sat_a.scale_x / dh
     w_v = par_y / sat_a.scale_y / dh
@@ -203,13 +229,88 @@ def build_design_matrix(
     return H_mat
 
 
-def _solve_wls(
+def _solve_wls_gpu(
+    H_matrix: np.ndarray,
+    y: np.ndarray,
+    W: np.ndarray,
+    regularization: float = 1e-10,
+    device: str = "cuda",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """GPU-accelerated WLS solve using PyTorch.
+
+    Uses torch.einsum with (H, W, ...) layout for efficient GPU utilization.
+    Float32 for speed; numerical agreement with float64 CPU is ~1e-7 relative.
+
+    Returns (x, chi2, sigma_h, sigma_u, sigma_v).
+    """
+    import torch
+
+    H_px, W_px = H_matrix.shape[:2]
+
+    # Transfer to GPU as float32, keeping (H, W, ...) spatial layout
+    H_t = torch.from_numpy(H_matrix.astype(np.float32)).to(device)
+    y_t = torch.from_numpy(y.astype(np.float32)).to(device)
+    W_t = torch.from_numpy(W.astype(np.float32)).to(device)
+
+    # Apply weights
+    sqrt_W = torch.sqrt(W_t)                               # (H,W,8)
+    H_w = H_t * sqrt_W.unsqueeze(-1)                       # (H,W,8,5)
+    y_w = y_t * sqrt_W                                     # (H,W,8)
+
+    # Column scaling for numerical stability
+    col_norms = torch.sqrt(
+        torch.einsum("hwki,hwki->hwi", H_w, H_w)          # (H,W,5)
+    )
+    col_norms = torch.where(col_norms > 0, col_norms, torch.ones_like(col_norms))
+    H_scaled = H_w / col_norms.unsqueeze(-2)               # (H,W,8,5)
+
+    # Normal equations: A x = b
+    A = torch.einsum("hwki,hwkj->hwij", H_scaled, H_scaled)  # (H,W,5,5)
+    b = torch.einsum("hwki,hwk->hwi", H_scaled, y_w)         # (H,W,5)
+
+    # Regularization
+    A += torch.eye(5, device=device, dtype=torch.float32) * regularization
+
+    # Solve
+    x_scaled = torch.linalg.solve(A, b)                    # (H,W,5)
+    x_sol = x_scaled / col_norms                            # (H,W,5)
+
+    # Residuals and chi2
+    y_pred = torch.einsum("hwij,hwj->hwi", H_t, x_sol)     # (H,W,8)
+    residual = y_t - y_pred
+    chi2 = (residual**2 * W_t).sum(dim=-1)                  # (H,W)
+
+    # Formal uncertainties
+    C_scaled = torch.linalg.inv(A)                          # (H,W,5,5)
+    inv_norms = 1.0 / col_norms                             # (H,W,5)
+    C = C_scaled * inv_norms.unsqueeze(-2) * inv_norms.unsqueeze(-1)
+    sigma_h = torch.sqrt(torch.clamp(C[..., 0, 0], min=0.0))
+    sigma_u = torch.sqrt(torch.clamp(C[..., 3, 3], min=0.0))
+    sigma_v = torch.sqrt(torch.clamp(C[..., 4, 4], min=0.0))
+
+    # Back to numpy float64
+    x_np = x_sol.cpu().numpy().astype(np.float64)
+    chi2_np = chi2.cpu().numpy().astype(np.float64)
+    sigma_h_np = sigma_h.cpu().numpy().astype(np.float64)
+    sigma_u_np = sigma_u.cpu().numpy().astype(np.float64)
+    sigma_v_np = sigma_v.cpu().numpy().astype(np.float64)
+
+    # Free GPU memory
+    del H_t, y_t, W_t, sqrt_W, H_w, y_w, H_scaled, A, b
+    del x_scaled, x_sol, y_pred, residual, chi2, C_scaled, C
+    del col_norms, inv_norms, sigma_h, sigma_u, sigma_v
+    torch.cuda.empty_cache()
+
+    return x_np, chi2_np, sigma_h_np, sigma_u_np, sigma_v_np
+
+
+def _solve_wls_cpu(
     H_matrix: np.ndarray,
     y: np.ndarray,
     W: np.ndarray,
     regularization: float = 1e-10,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Single-pass WLS solve (internal helper).
+    """CPU WLS solve (numpy).
 
     Returns (x, chi2, sigma_h, sigma_u, sigma_v).
     """
@@ -255,6 +356,27 @@ def _solve_wls(
     return x, chi2, sigma_h, sigma_u, sigma_v
 
 
+def _solve_wls(
+    H_matrix: np.ndarray,
+    y: np.ndarray,
+    W: np.ndarray,
+    regularization: float = 1e-10,
+    device: str = "cpu",
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """WLS solve dispatcher — uses GPU if available, falls back to CPU.
+
+    Returns (x, chi2, sigma_h, sigma_u, sigma_v).
+    """
+    if device != "cpu":
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return _solve_wls_gpu(H_matrix, y, W, regularization, device)
+        except ImportError:
+            pass
+    return _solve_wls_cpu(H_matrix, y, W, regularization)
+
+
 def solve_stereo_winds(
     disparities: dict[str, np.ndarray],
     H_matrix: np.ndarray,
@@ -263,6 +385,7 @@ def solve_stereo_winds(
     sat_a: SatelliteConfig | None = None,
     sat_b: SatelliteConfig | None = None,
     n_iter: int = 1,
+    device: str = "cpu",
 ) -> dict[str, np.ndarray]:
     """Solve the 5-state weighted least squares system per pixel.
 
@@ -288,11 +411,16 @@ def solve_stereo_winds(
     solution : dict with keys h, p_u, p_v, V_u, V_v, chi2, sigma_h,
                sigma_u, sigma_v, quality_flag, delta_h_history
     """
-    H_matrix = H_matrix.copy()
+    can_iterate = n_iter > 1 and sat_a is not None and sat_b is not None
+    actual_iters = n_iter if can_iterate else 1
+
+    # Only copy if we'll mutate H_matrix during iteration
+    if actual_iters > 1:
+        H_matrix = H_matrix.copy()
     H_px, W_px = H_matrix.shape[:2]
 
     # Stack 8 observations
-    y = np.zeros((H_px, W_px, 8), dtype=np.float64)
+    y = np.empty((H_px, W_px, 8), dtype=np.float64)
     for i, key in enumerate(["D1", "D2", "D3", "D4"]):
         flow = disparities[key]
         y[:, :, 2 * i] = flow[0]
@@ -303,15 +431,17 @@ def solve_stereo_winds(
     else:
         W = weights
 
-    can_iterate = n_iter > 1 and sat_a is not None and sat_b is not None
-    actual_iters = n_iter if can_iterate else 1
+    # Precompute lat/lon grid once for iterative parallax updates
+    lat_lon = None
+    if can_iterate:
+        lat_lon = _precompute_latlon(sat_a)
 
     delta_h_history = []
     h_prev = None
 
     for iteration in range(actual_iters):
         x, chi2, sigma_h, sigma_u, sigma_v = _solve_wls(
-            H_matrix, y, W, regularization,
+            H_matrix, y, W, regularization, device=device,
         )
         h = x[:, :, 0]
 
@@ -347,7 +477,7 @@ def solve_stereo_winds(
         if can_iterate and iteration < actual_iters - 1:
             h_clipped = np.clip(np.where(np.isfinite(h), h, 0.0), 0.0, 20000.0)
             w_u_new, w_v_new = compute_parallax_vectors_at_h(
-                sat_a, sat_b, h_clipped,
+                sat_a, sat_b, h_clipped, lat_lon=lat_lon,
             )
             H_matrix[:, :, 4, 0] = w_u_new
             H_matrix[:, :, 5, 0] = w_v_new
@@ -480,11 +610,11 @@ def pixels_to_wind_ms(
     -------
     u_ms, v_ms : wind components in m/s (east, north)
     """
-    # Pixel scale in meters at nadir
-    px_scale_x = abs(sat.satellite_height_m * sat.scale_x)
-    px_scale_y = abs(sat.satellite_height_m * sat.scale_y)
+    from .navigation import compute_pixel_scale
 
-    u_ms = V_u * px_scale_x / dt_seconds
-    v_ms = V_v * px_scale_y / dt_seconds
+    dx_m, dy_m = compute_pixel_scale(sat)
+
+    u_ms = V_u * dx_m / dt_seconds
+    v_ms = V_v * dy_m / dt_seconds
 
     return u_ms, v_ms

@@ -197,3 +197,65 @@ def compute_zenith_angle(
     zenith = np.degrees(np.arcsin(np.clip(sin_zenith, -1.0, 1.0)))
 
     return zenith
+
+
+_pixel_scale_cache: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+
+def compute_pixel_scale(
+    sat: SatelliteConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-pixel ground distances for the full fixed grid.
+
+    Each pixel on the geostationary grid subtends the same scanning angle
+    increment, but the corresponding ground distance varies with viewing
+    geometry. At nadir the pixel footprint is ~2 km (for 2 km bands), but
+    it grows toward the limb.
+
+    Method: evaluate the geostationary projection at half-pixel offsets in
+    each direction, convert to ECEF, and compute the 3-D distance.
+
+    Results are cached by satellite_id since the grid geometry is fixed.
+
+    Parameters
+    ----------
+    sat : SatelliteConfig with grid dimensions and projection parameters
+
+    Returns
+    -------
+    dx_m : (n_rows, n_cols) east-west ground distance per pixel (meters)
+    dy_m : (n_rows, n_cols) north-south ground distance per pixel (meters)
+    NaN for off-Earth pixels.
+    """
+    cache_key = f"{sat.satellite_id}_{sat.n_rows}_{sat.n_cols}_{sat.scale_x}"
+    if cache_key in _pixel_scale_cache:
+        return _pixel_scale_cache[cache_key]
+    cols = np.arange(sat.n_cols, dtype=np.float64)
+    rows = np.arange(sat.n_rows, dtype=np.float64)
+    col2d, row2d = np.meshgrid(cols, rows)
+
+    x_center = col2d * sat.scale_x + sat.x_offset
+    y_center = row2d * sat.scale_y + sat.y_offset
+
+    half_sx = sat.scale_x / 2.0
+    half_sy = sat.scale_y / 2.0
+
+    a = sat.semi_major_m
+    b = sat.semi_minor_m
+
+    # --- dx: east-west ground distance per pixel ---
+    lat_l, lon_l = fixed_grid_to_geodetic(x_center - half_sx, y_center, sat)
+    lat_r, lon_r = fixed_grid_to_geodetic(x_center + half_sx, y_center, sat)
+    xl, yl, zl = geodetic_to_ecef(lat_l, lon_l, 0.0, a, b)
+    xr, yr, zr = geodetic_to_ecef(lat_r, lon_r, 0.0, a, b)
+    dx_m = np.sqrt((xr - xl)**2 + (yr - yl)**2 + (zr - zl)**2)
+
+    # --- dy: north-south ground distance per pixel ---
+    lat_t, lon_t = fixed_grid_to_geodetic(x_center, y_center - half_sy, sat)
+    lat_b, lon_b = fixed_grid_to_geodetic(x_center, y_center + half_sy, sat)
+    xt, yt, zt = geodetic_to_ecef(lat_t, lon_t, 0.0, a, b)
+    xb, yb, zb = geodetic_to_ecef(lat_b, lon_b, 0.0, a, b)
+    dy_m = np.sqrt((xb - xt)**2 + (yb - yt)**2 + (zb - zt)**2)
+
+    _pixel_scale_cache[cache_key] = (dx_m, dy_m)
+    return dx_m, dy_m

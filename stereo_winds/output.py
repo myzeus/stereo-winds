@@ -155,7 +155,10 @@ def write_netcdf(ds: xr.Dataset, path: str | Path) -> None:
         if ds[var].dtype in (np.float32, np.float64):
             encoding[var] = {"zlib": True, "complevel": 4}
 
-    ds.to_netcdf(str(path), engine="h5netcdf", encoding=encoding)
+    try:
+        ds.to_netcdf(str(path), engine="h5netcdf", encoding=encoding)
+    except Exception:
+        ds.to_netcdf(str(path), engine="netcdf4", encoding=encoding)
 
 
 def write_zarr(ds: xr.Dataset, path: str | Path) -> None:
