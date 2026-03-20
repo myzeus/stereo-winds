@@ -97,7 +97,7 @@ def _height_gradient(h_2d):
 
 
 def collocate(stereo_ds, igra_ds, min_height=0, box_half=2,
-              sigma_h_max=2000, h_grad_max=3000, chi2_max=0.2):
+              sigma_h_max=500, h_grad_max=3000, chi2_max=0.2):
     """Collocate stereo winds with IGRA profiles across all shared times.
 
     Uses a (2*box_half+1)^2 neighborhood median and height-gradient

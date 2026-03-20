@@ -254,7 +254,7 @@ def load_stereo(band, times):
 
 
 def collocate(stereo_ds, amv_data, min_height=0, box_half=2,
-              sigma_h_max=2000, h_grad_max=3000, chi2_max=0.2,
+              sigma_h_max=500, h_grad_max=3000, chi2_max=0.2,
               max_h_diff=3000):
     """Collocate stereo winds with AMV targets across all shared times.
 

@@ -246,7 +246,7 @@ def station_pixel_coords(lats, lons):
 
 def triple_collocate(stereo_ds, igra_ds, amv_data,
                      min_height=MIN_HEIGHT, box_half=2,
-                     sigma_h_max=2000, h_grad_max=3000, chi2_max=0.2):
+                     sigma_h_max=1000, h_grad_max=3000, chi2_max=0.2):
     """Find triplets where sonde, AMV, and stereo all observe the same point."""
     keys = [
         "u_stereo", "v_stereo", "h_stereo",
