@@ -95,9 +95,18 @@ def create_output_dataset(
             solution.get("p_v", np.zeros((n_rows, n_cols))),
             "Position Correction (N-S)", "pixel",
         ),
-        "quality_flag": _make_var(
-            solution.get("quality_flag", np.ones((n_rows, n_cols))),
-            "Quality Flag", "1",
+        "quality_flag": xr.Variable(
+            ["y", "x"],
+            solution.get("quality_flag", np.zeros((n_rows, n_cols), dtype=np.float32)).astype(np.float32),
+            attrs={
+                "long_name": "Quality Assurance Flag",
+                "units": "1",
+                "flag_values": np.array([0, 1, 2], dtype=np.float32),
+                "flag_meanings": "no_retrieval low_quality high_quality",
+                "valid_range": np.array([0, 2], dtype=np.float32),
+                "grid_mapping": "goes_imager_projection",
+                "comment": "Higher values = stricter QC. Level 1 for general use; 2 for validation.",
+            },
         ),
         "goes_imager_projection": xr.Variable(
             [], np.int32(0), attrs=grid_mapping_attrs,

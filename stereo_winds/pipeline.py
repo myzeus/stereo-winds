@@ -18,6 +18,7 @@ from .data_loading import load_stereo_scenes
 from .disparity import StereoDisparity
 from .navigation import pixel_to_scanning_angle
 from .output import create_output_dataset, write_netcdf
+from .qa import compute_qa_flag
 from .remap import (
     build_remap_lut,
     compute_valid_mask,
@@ -145,12 +146,13 @@ class StereoWindPipeline:
 
         return disparities
 
-    def run(self, t0: datetime) -> xr.Dataset:
+    def run(self, t0: datetime, write_nc: bool = True) -> xr.Dataset:
         """Run the full stereo wind retrieval for a single timestep.
 
         Parameters
         ----------
         t0 : center time for the retrieval
+        write_nc : if True, write a NetCDF file to output_dir
 
         Returns
         -------
@@ -170,10 +172,11 @@ class StereoWindPipeline:
                 band_a=cfg.band,
                 cache_dir=cfg.cache_dir,
                 product=cfg.product,
+                stream=cfg.stream,
             )
         except FileNotFoundError as e:
             logger.warning("B satellite data missing: %s. Falling back to temporal-only.", e)
-            return self._run_temporal_only(t0)
+            return self._run_temporal_only(t0, write_nc=write_nc)
 
         # Use canonical satellite configs for geometry (remap, parallax).
         # Runtime configs from satpy may have slightly different offsets
@@ -227,25 +230,25 @@ class StereoWindPipeline:
         solution["u_wind"] = u_ms
         solution["v_wind"] = v_ms
 
-        # Apply chi2 threshold to quality flag
-        solution["quality_flag"][solution["chi2"] > cfg.chi2_threshold] = 0.0
-
-        # Apply valid mask
+        # Compute multi-level QA flag
         valid_mask = compute_valid_mask(col_b, row_b, sat_a, sat_b, cfg.max_zenith_angle)
-        solution["quality_flag"][~valid_mask] = 0.0
+        solution["quality_flag"] = compute_qa_flag(
+            solution, valid_mask, chi2_threshold=cfg.chi2_threshold,
+        )
 
         # 7. Write output
-        logger.info("Step 7: Writing output...")
+        logger.info("Step 7: Creating output dataset...")
         ds = create_output_dataset(solution, sat_a, t0, cfg)
 
-        output_path = cfg.output_dir / f"stereo_winds_{t0:%Y%m%d_%H%M}.nc"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        write_netcdf(ds, output_path)
-        logger.info("Output written to %s", output_path)
+        if write_nc:
+            output_path = cfg.output_dir / f"stereo_winds_{t0:%Y%m%d_%H%M}.nc"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            write_netcdf(ds, output_path)
+            logger.info("Output written to %s", output_path)
 
         return ds
 
-    def _run_temporal_only(self, t0: datetime) -> xr.Dataset:
+    def _run_temporal_only(self, t0: datetime, write_nc: bool = True) -> xr.Dataset:
         """Fallback: temporal-only wind retrieval from A triplet.
 
         Uses only 2 pairs (A0→A_minus, A0→A_plus), solving for
@@ -262,6 +265,7 @@ class StereoWindPipeline:
             band_a=cfg.band,
             cache_dir=cfg.cache_dir,
             product=cfg.product,
+            stream=cfg.stream,
         )
 
         sat_a = scenes["A0"][1]
@@ -304,9 +308,10 @@ class StereoWindPipeline:
         ds = create_output_dataset(solution, sat_a, t0, cfg)
         ds.attrs["retrieval_mode"] = "temporal_only"
 
-        output_path = cfg.output_dir / f"stereo_winds_temporal_{t0:%Y%m%d_%H%M}.nc"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        write_netcdf(ds, output_path)
-        logger.info("Temporal-only output written to %s", output_path)
+        if write_nc:
+            output_path = cfg.output_dir / f"stereo_winds_temporal_{t0:%Y%m%d_%H%M}.nc"
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            write_netcdf(ds, output_path)
+            logger.info("Temporal-only output written to %s", output_path)
 
         return ds

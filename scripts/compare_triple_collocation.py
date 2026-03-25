@@ -246,7 +246,9 @@ def station_pixel_coords(lats, lons):
 
 def triple_collocate(stereo_ds, igra_ds, amv_data,
                      min_height=MIN_HEIGHT, box_half=2,
-                     sigma_h_max=1000, h_grad_max=3000, chi2_max=0.2):
+                     sigma_h_max_low=1000, sigma_h_max_mid=2000,
+                     sigma_h_max_high=1000,
+                     h_grad_max=3000, chi2_max=0.2):
     """Find triplets where sonde, AMV, and stereo all observe the same point."""
     keys = [
         "u_stereo", "v_stereo", "h_stereo",
@@ -325,11 +327,18 @@ def triple_collocate(stereo_ds, igra_ds, amv_data,
         hgrad_nb = hgrad[r_nb, c_nb]
 
         spd_nb = np.sqrt(u_nb**2 + v_nb**2)
+        # Height-dependent sigma_h threshold: relaxed at mid-levels
+        # where parallax sensitivity is weakest
+        sigh_thresh = np.where(
+            h_nb < 3000, sigma_h_max_low,        # low clouds
+            np.where(h_nb < 7000, sigma_h_max_mid,  # mid-level
+                     sigma_h_max_high),            # high clouds
+        )
         qa_nb = (
             np.isfinite(u_nb) & np.isfinite(h_nb)
             & (qf_nb > 0.5)
             & (chi2_nb <= chi2_max)
-            & (sigh_nb <= sigma_h_max)
+            & (sigh_nb <= sigh_thresh)
             & (hgrad_nb <= h_grad_max)
             & (spd_nb <= 100)
             & (h_nb >= min_height) & (h_nb <= 20000)

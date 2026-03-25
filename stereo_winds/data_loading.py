@@ -190,10 +190,11 @@ def load_goes_scene(
     satellite: str = "goes16",
     cache_dir: str | Path | None = None,
     product: str = "ABI-L1b-RadF",
+    stream: bool = False,
 ) -> tuple[np.ndarray, SatelliteConfig]:
     """Load a GOES ABI scene using zeus, returning native fixed-grid data.
 
-    Uses GOES.data_at_time(download=True) for time-snapping, S3 download,
+    Uses GOES.data_at_time() for time-snapping, S3 download or streaming,
     and satpy-based loading. Converts satpy output back to native fixed-grid
     coordinates needed by the stereo solver.
 
@@ -204,6 +205,7 @@ def load_goes_scene(
     satellite : satellite identifier ("goes16", "goes18", "goes19")
     cache_dir : local cache directory for downloaded files
     product : ABI product type ("ABI-L1b-RadF", "ABI-L1b-RadC", "ABI-L1b-RadM")
+    stream : if True, read directly from S3 without caching to disk
 
     Returns
     -------
@@ -211,12 +213,14 @@ def load_goes_scene(
     sat_config : SatelliteConfig with scanning-angle coordinates in radians
     """
     source = _make_goes_source(satellite, band, cache_dir, product)
-    logger.info("Loading %s %s at %s via zeus", satellite, band, t)
+    logger.info("Loading %s %s at %s via zeus%s", satellite, band, t,
+                " (streaming)" if stream else "")
 
-    # Ensure band-specific files are downloaded (zeus cache is not band-aware)
-    _ensure_band_downloaded(source, t, band)
+    if not stream:
+        # Ensure band-specific files are downloaded (zeus cache is not band-aware)
+        _ensure_band_downloaded(source, t, band)
 
-    ds = source.data_at_time(t, download=True)
+    ds = source.data_at_time(t, download=not stream)
 
     # Extract 2D array: squeeze time and band dims
     data = ds["Rad"].values[0, 0, :, :].astype(np.float32)
@@ -274,6 +278,7 @@ def load_stereo_scenes(
     band_b: str | None = None,
     cache_dir: str | Path | None = None,
     product: str = "ABI-L1b-RadF",
+    stream: bool = False,
 ) -> dict[str, tuple[np.ndarray, SatelliteConfig]]:
     """Load all 5 scenes for a stereo retrieval.
 
@@ -310,7 +315,7 @@ def load_stereo_scenes(
         band = band_b if is_sat_b else band_a
 
         if "goes" in sat_id:
-            data, config = load_goes_scene(t, band, sat_id, cache_dir, product=product)
+            data, config = load_goes_scene(t, band, sat_id, cache_dir, product=product, stream=stream)
         elif "himawari" in sat_id:
             files = download_ahi(t, band, sat_id, cache_dir)
             if not files:

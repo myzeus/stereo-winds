@@ -118,6 +118,9 @@ class StereoPairConfig:
     output_dir: Path = field(default_factory=lambda: Path("output"))
     cache_dir: Path = field(default_factory=lambda: Path("cache"))
 
+    # Data loading
+    stream: bool = False  # if True, read GOES data directly from S3
+
     # Quality control
     max_zenith_angle: float = 80.0
     chi2_threshold: float = 10.0

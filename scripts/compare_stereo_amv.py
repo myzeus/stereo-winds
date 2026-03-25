@@ -254,7 +254,9 @@ def load_stereo(band, times):
 
 
 def collocate(stereo_ds, amv_data, min_height=0, box_half=2,
-              sigma_h_max=500, h_grad_max=3000, chi2_max=0.2,
+              sigma_h_max_low=1000, sigma_h_max_mid=2000,
+              sigma_h_max_high=1000,
+              h_grad_max=3000, chi2_max=0.2,
               max_h_diff=3000):
     """Collocate stereo winds with AMV targets across all shared times.
 
@@ -350,13 +352,17 @@ def collocate(stereo_ds, amv_data, min_height=0, box_half=2,
         hgrad = _height_gradient(h_grid[t])
         hgrad_nb = hgrad[r_nb, c_nb]
 
-        # Per-pixel QA mask
+        # Per-pixel QA mask — height-dependent sigma_h threshold
         spd_nb = np.sqrt(u_nb**2 + v_nb**2)
+        sigh_thresh = np.where(
+            h_nb < 3000, sigma_h_max_low,
+            np.where(h_nb < 7000, sigma_h_max_mid, sigma_h_max_high),
+        )
         qa_nb = (
             np.isfinite(u_nb) & np.isfinite(h_nb)
             & (qf_nb > 0.5)
             & (chi2_nb <= chi2_max)
-            & (sigh_nb <= sigma_h_max)
+            & (sigh_nb <= sigh_thresh)
             & (hgrad_nb <= h_grad_max)
             & (spd_nb <= 100)
             & (h_nb >= min_height) & (h_nb <= 20000)

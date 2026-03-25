@@ -16,6 +16,9 @@ dependencies = [
     "torch>=2.0",
     "matplotlib>=3.7",
     "cartopy>=0.21",
+    "filelock>=3.12",
+    "mpi4py>=4.0",
+    "zarr>=3.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +29,7 @@ dev = [
 
 [project.scripts]
 stereo-winds = "scripts.run_stereo:main"
+stereo-winds-batch = "scripts.run_batch:main"
 
 [tool.setuptools.packages.find]
 include = ["stereo_winds*"]
