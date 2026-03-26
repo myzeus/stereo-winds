@@ -104,12 +104,12 @@ class TestZarrStorePathRouting:
         )
         assert path == Path("out/goes19_goes18/C14/2025-06-15.zarr")
 
-    def test_daily_for_1h_cadence(self):
+    def test_monthly_for_1h_cadence(self):
         path = ZarrStore.store_path_for(
             Path("out"), "goes19_goes18", "C04",
             datetime(2025, 1, 1, 0, 0), freq_minutes=60,
         )
-        assert path == Path("out/goes19_goes18/C04/2025-01-01.zarr")
+        assert path == Path("out/goes19_goes18/C04/2025-01.zarr")
 
 
 class TestZarrStoreIO:

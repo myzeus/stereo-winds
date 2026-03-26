@@ -99,9 +99,9 @@ class ZarrStore:
     ) -> Path:
         """Determine the Zarr store path for a given timestep.
 
-        Monthly stores for freq >= 360 (6 hours), daily otherwise.
+        Monthly stores for freq >= 60 (1 hour), daily otherwise.
         """
-        if freq_minutes >= 360:
+        if freq_minutes >= 60:
             period = t0.strftime("%Y-%m")
         else:
             period = t0.strftime("%Y-%m-%d")
@@ -138,10 +138,14 @@ class ZarrStore:
         if t0_np not in ds.time.values:
             ds.close()
             return False
-        # Check a single pixel of u_wind for non-NaN
-        val = float(ds["u_wind"].sel(time=t0_np).isel(y=0, x=0).values)
+        # Sample a cross of pixels near the center — (0,0) may be off-disk
+        ny, nx = ds.sizes["y"], ds.sizes["x"]
+        cy, cx = ny // 2, nx // 2
+        sample = ds["u_wind"].sel(time=t0_np).isel(
+            y=slice(cy - 2, cy + 3), x=slice(cx - 2, cx + 3),
+        ).values
         ds.close()
-        return np.isfinite(val)
+        return bool(np.any(np.isfinite(sample)))
 
     @staticmethod
     def _build_encoding() -> dict:
@@ -156,20 +160,28 @@ class ZarrStore:
         return encoding
 
     @staticmethod
-    def _monthly_times(t0: datetime, freq_minutes: int) -> pd.DatetimeIndex:
-        """Generate all time steps for the month containing t0."""
-        start = datetime(t0.year, t0.month, 1)
-        n_days = calendar.monthrange(t0.year, t0.month)[1]
-        end = datetime(t0.year, t0.month, n_days, 23, 59)
+    def _period_times(t0: datetime, freq_minutes: int) -> pd.DatetimeIndex:
+        """Generate all time steps for the period (month or day) containing t0.
+
+        Monthly periods for freq >= 60, daily otherwise.
+        """
+        if freq_minutes >= 60:
+            start = datetime(t0.year, t0.month, 1)
+            n_days = calendar.monthrange(t0.year, t0.month)[1]
+            end = datetime(t0.year, t0.month, n_days, 23, 59)
+        else:
+            start = datetime(t0.year, t0.month, t0.day)
+            end = datetime(t0.year, t0.month, t0.day, 23, 59)
         return pd.date_range(start, end, freq=f"{freq_minutes}min")
 
     def initialize(self, t0: datetime, freq_minutes: int, sat_config) -> None:
-        """Pre-allocate the store with all time slots for the month.
+        """Pre-allocate the store with all time slots for the period.
 
         Creates a NaN-filled dataset with the full time axis so that
         individual timesteps can be written via region indexing.
+        Monthly periods for freq >= 360, daily otherwise.
         """
-        times = self._monthly_times(t0, freq_minutes)
+        times = self._period_times(t0, freq_minutes)
         n_times = len(times)
         n_rows, n_cols = sat_config.n_rows, sat_config.n_cols
 
@@ -245,12 +257,10 @@ class ZarrStore:
         return f"{sat_pair}/{freq_label}/{band}/{period}"
 
     def _compute_time_idx(self, t0_np, freq_minutes: int) -> int:
-        """Compute the time index for a given timestep within its month."""
-        times = self._monthly_times(
-            datetime(
-                pd.Timestamp(t0_np).year,
-                pd.Timestamp(t0_np).month, 1,
-            ),
+        """Compute the time index for a given timestep within its period."""
+        ts = pd.Timestamp(t0_np)
+        times = self._period_times(
+            datetime(ts.year, ts.month, ts.day),
             freq_minutes,
         )
         idx = np.searchsorted(times.values, t0_np)
@@ -439,7 +449,7 @@ class BatchProcessor:
                 logger.info("Initializing Arraylake group: %s", group)
                 import dask.array as da
 
-                monthly_times = ZarrStore._monthly_times(t0, freq)
+                monthly_times = ZarrStore._period_times(t0, freq)
                 n_rows, n_cols = sat_config.n_rows, sat_config.n_cols
                 chunks = (1, SPATIAL_CHUNK, SPATIAL_CHUNK)
                 shape = (len(monthly_times), n_rows, n_cols)
@@ -490,6 +500,30 @@ class BatchProcessor:
             store.initialize(t0, self.config.freq_minutes, sat_config)
         return store
 
+    def _arraylake_has_timestep(
+        self, store: ZarrStore, band: str, t0: datetime,
+    ) -> bool:
+        """Check if a timestep already has data in Arraylake."""
+        try:
+            repo = self.arraylake_repo
+            branch = self.config.arraylake_branch
+            group = ZarrStore.arraylake_group_for(
+                self.config.sat_pair_id, band, t0, self.config.freq_minutes,
+            )
+            session = repo.readonly_session(branch)
+            ds = xr.open_zarr(session.store, group=group, consolidated=False)
+            t0_np = np.datetime64(t0, "ns")
+            if t0_np not in ds.time.values:
+                return False
+            ny, nx = ds.sizes["y"], ds.sizes["x"]
+            cy, cx = ny // 2, nx // 2
+            sample = ds["u_wind"].sel(time=t0_np).isel(
+                y=slice(cy - 2, cy + 3), x=slice(cx - 2, cx + 3),
+            ).values
+            return bool(np.any(np.isfinite(sample)))
+        except Exception:
+            return False
+
     def _process_single(self, t0: datetime, band: str) -> bool:
         """Process one timestep for one band.
 
@@ -501,6 +535,10 @@ class BatchProcessor:
         if write_local:
             store = self._ensure_store_initialized(band, t0)
             if store.has_timestep(t0):
+                logger.info("Skipping %s %s -- already processed", t0, band)
+                return True
+        else:
+            if self._arraylake_has_timestep(store, band, t0):
                 logger.info("Skipping %s %s -- already processed", t0, band)
                 return True
 
