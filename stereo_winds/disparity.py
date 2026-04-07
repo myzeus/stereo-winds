@@ -39,8 +39,13 @@ def _ensure_compat_checkpoint(ckpt_path: str) -> str:
         p = Path(compat_path)
         if not p.exists():
             logger.info("Converting PL checkpoint to FlowRunner format: %s", p.name)
+            # Strip 'raft.' prefix from fine-tuned PL checkpoints
+            sd = data["state_dict"]
+            if any(k.startswith("raft.") for k in sd):
+                sd = {k.removeprefix("raft."): v for k, v in sd.items()
+                      if k.startswith("raft.")}
             torch.save(
-                {"model": data["state_dict"], "global_step": data.get("global_step", 0)},
+                {"model": sd, "global_step": data.get("global_step", 0)},
                 compat_path,
             )
         return compat_path
@@ -65,7 +70,9 @@ class StereoDisparity:
         overlap: int = 256,
         batch_size: int = 8,
         device: str = "cpu",
+        lowmem: bool = False,
     ):
+        self.lowmem = lowmem
         import sys
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "zeus"))
         from zeus.inference.inference_flows import FlowRunner
@@ -97,7 +104,7 @@ class StereoDisparity:
         # FlowRunner expects (1, 1, H, W) — batch, channels, height, width
         i1 = img1[np.newaxis, np.newaxis, :, :]
         i2 = img2[np.newaxis, np.newaxis, :, :]
-        flow = self.runner.forward(i1, i2)
+        flow = self.runner.forward(i1, i2, lowmem=self.lowmem)
 
         # Squeeze batch dimension if present
         if flow.ndim == 4:
