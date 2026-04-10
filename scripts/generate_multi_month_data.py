@@ -38,18 +38,39 @@ logger = logging.getLogger(__name__)
 BASE = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE / "data"
 EARTHCARE_DIR = DATA_DIR / "earthcare"
-TRAINING_DIR = DATA_DIR / "stereo_training"
+TRAINING_DIR = Path("/home/ubuntu/earthnet-us-east-3/data/stereo_training")
 
 # (start, end, label, YYYYMM key)
 TARGET_MONTHS = [
+    ("2024-01-01", "2024-02-01", "jan2024", "202401"),
+    ("2024-02-01", "2024-03-01", "feb2024", "202402"),
+    ("2024-03-01", "2024-04-01", "mar2024", "202403"),
+    ("2024-04-01", "2024-05-01", "apr2024", "202404"),
+    ("2024-05-01", "2024-06-01", "may2024", "202405"),
+    ("2024-06-01", "2024-07-01", "jun2024", "202406"),
+    ("2024-07-01", "2024-08-01", "jul2024", "202407"),
+    ("2024-08-01", "2024-09-01", "aug2024", "202408"),
+    ("2024-09-01", "2024-10-01", "sep2024", "202409"),
+    ("2024-10-01", "2024-11-01", "oct2024", "202410"),
+    ("2024-11-01", "2024-12-01", "nov2024", "202411"),
+    ("2024-12-01", "2025-01-01", "dec2024", "202412"),
+    ("2025-01-01", "2025-02-01", "jan2025", "202501"),
+    ("2025-02-01", "2025-03-01", "feb2025", "202502"),
+    ("2025-03-01", "2025-04-01", "mar2025", "202503"),
+    ("2025-04-01", "2025-05-01", "apr2025", "202504"),
+    ("2025-05-01", "2025-06-01", "may2025", "202505"),
+    ("2025-06-01", "2025-07-01", "jun2025", "202506"),
     ("2025-07-01", "2025-08-01", "jul2025", "202507"),
+    ("2025-08-01", "2025-09-01", "aug2025", "202508"),
     ("2025-09-01", "2025-10-01", "sep2025", "202509"),
+    ("2025-10-01", "2025-11-01", "oct2025", "202510"),
     ("2025-11-01", "2025-12-01", "nov2025", "202511"),
+    ("2025-12-01", "2026-01-01", "dec2025", "202512"),
     ("2026-01-01", "2026-02-01", "jan2026", "202601"),
     ("2026-02-01", "2026-03-01", "feb2026", "202602"),
 ]
 
-SATELLITE_A = "goes19"
+DEFAULT_SAT_A = "goes19"
 SATELLITE_B = "goes18"
 BAND = "C14"
 COMBINED_PARQUET = EARTHCARE_DIR / "all_months_collocation.parquet"
@@ -67,37 +88,50 @@ def run_cmd(cmd: list[str], description: str) -> bool:
     return True
 
 
-def phase_zarr(months: list[tuple[str, str, str, str]]) -> None:
-    """Generate GOES Zarr cubes for each target month."""
-    for start, end, label, key in months:
-        # GOES-19 native
-        run_cmd(
-            [
-                sys.executable, "-m", "stereo_winds.training_data",
-                "--satellite", SATELLITE_A,
-                "--band", BAND,
-                "--monthly",
-                "--start", f"{start}T00:00",
-                "--end", f"{end}T00:00",
-                "--output-dir", str(TRAINING_DIR),
-            ],
-            f"{SATELLITE_A} {BAND} {label}",
-        )
+def phase_zarr(
+    months: list[tuple[str, str, str, str]],
+    times_file: str | None = None,
+    sat_a: str = DEFAULT_SAT_A,
+    bands: list[str] | None = None,
+) -> None:
+    """Generate GOES Zarr cubes for each target month and band.
 
-        # GOES-18 remapped onto GOES-19 grid
-        run_cmd(
-            [
-                sys.executable, "-m", "stereo_winds.training_data",
-                "--satellite", SATELLITE_B,
-                "--band", BAND,
-                "--monthly",
-                "--remap-to", SATELLITE_A,
-                "--start", f"{start}T00:00",
-                "--end", f"{end}T00:00",
-                "--output-dir", str(TRAINING_DIR),
-            ],
-            f"{SATELLITE_B} remap {SATELLITE_A} {BAND} {label}",
-        )
+    If ``times_file`` is provided, only timestamps from that file (filtered to
+    the month range) are processed. Useful for sparse sonde-supervised training
+    where we only need 3 GOES scans per 12 hours.
+    """
+    extra = ["--times-file", times_file] if times_file else []
+    band_list = bands if bands else [BAND]
+    for band in band_list:
+        for start, end, label, key in months:
+            # Sat A native
+            run_cmd(
+                [
+                    sys.executable, "-m", "stereo_winds.training_data",
+                    "--satellite", sat_a,
+                    "--band", band,
+                    "--monthly",
+                    "--start", f"{start}T00:00",
+                    "--end", f"{end}T00:00",
+                    "--output-dir", str(TRAINING_DIR),
+                ] + extra,
+                f"{sat_a} {band} {label}",
+            )
+
+            # GOES-18 remapped onto Sat A grid
+            run_cmd(
+                [
+                    sys.executable, "-m", "stereo_winds.training_data",
+                    "--satellite", SATELLITE_B,
+                    "--band", band,
+                    "--monthly",
+                    "--remap-to", sat_a,
+                    "--start", f"{start}T00:00",
+                    "--end", f"{end}T00:00",
+                    "--output-dir", str(TRAINING_DIR),
+                ] + extra,
+                f"{SATELLITE_B} remap {sat_a} {band} {label}",
+            )
 
 
 def phase_collocation(months: list[tuple[str, str, str, str]]) -> None:
@@ -178,6 +212,22 @@ def main():
         default=None,
         help="Comma-separated YYYYMM keys to process (e.g. 202507,202509). Default: all.",
     )
+    parser.add_argument(
+        "--times-file",
+        default=None,
+        help="Path to a text file with one ISO timestamp per line. If provided, "
+             "the zarr phase only fetches these timestamps (sparse sonde-aligned mode).",
+    )
+    parser.add_argument(
+        "--sat-a",
+        default=DEFAULT_SAT_A,
+        help="Sat A satellite (goes19, goes16). GOES-East slot. Default: goes19.",
+    )
+    parser.add_argument(
+        "--bands",
+        default=BAND,
+        help="Comma-separated list of bands to process (e.g. C08,C09,C10,C12,C14)",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -197,8 +247,10 @@ def main():
 
     logger.info("Target months: %s", [m[2] for m in months])
 
+    bands_list = [b.strip() for b in args.bands.split(",")]
+
     if args.phase in ("zarr", "all"):
-        phase_zarr(months)
+        phase_zarr(months, times_file=args.times_file, sat_a=args.sat_a, bands=bands_list)
 
     if args.phase in ("collocation", "all"):
         phase_collocation(months)

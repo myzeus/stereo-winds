@@ -77,6 +77,11 @@ class StereoWindsModule(LightningModule):
         height_reg_weight: float = 0.0,
         wind_reg_weight: float = 0.0,
         ec_weight: float = 0.0,
+        sonde_weight: float = 0.0,
+        sonde_huber_delta: float = 5.0,
+        sonde_loss_type: str = "huber",
+        sonde_match_mode: str = "interp",
+        rss_weight: float = 1.0,
         iters: int = 12,
         log_media_step: int = 50,
     ):
@@ -117,10 +122,31 @@ class StereoWindsModule(LightningModule):
             self.ec_layer_loss_fn = SparseCloudContainmentLoss(delta=1.0)
             logger.info("EarthCARE supervision enabled (weight=%.4f)", ec_weight)
 
+        # IGRA radiosonde wind supervision
+        # Wind conversion uses per-pixel ground scale `dx_m`, `dy_m` provided
+        # in each batch (computed once by the dataset). The conversion is just
+        # `V_u * dx_m / dt_seconds` which is differentiable through V_u.
+        self.sonde_weight = sonde_weight
+        if sonde_weight > 0:
+            from .sparse_loss import SparseWindLoss
+            self.sonde_loss_fn = SparseWindLoss(
+                delta=sonde_huber_delta,
+                require_bracket=True,
+                loss_type=sonde_loss_type,
+                match_mode=sonde_match_mode,
+            )
+            logger.info(
+                "IGRA sonde supervision enabled (weight=%.4f, type=%s, mode=%s, delta=%.1f m/s)",
+                sonde_weight, sonde_loss_type, sonde_match_mode, sonde_huber_delta,
+            )
+
         self.learning_rate = learning_rate
         self.bounds_weight = bounds_weight
+        self.rss_weight = rss_weight
         self.iters = iters
         self.log_media_step = log_media_step
+        if rss_weight == 0:
+            logger.info("RSS loss disabled (rss_weight=0)")
 
     def _load_raft_weights(self, ckpt_path: str, target=None) -> None:
         """Load RAFT weights from PL or FlowRunner checkpoint."""
@@ -134,8 +160,10 @@ class StereoWindsModule(LightningModule):
         else:
             sd = data
 
-        # Strip "module." prefix from DataParallel wrapping if present
+        # Strip wrappers: "module." from DataParallel, "raft." from PL
         sd = {k.removeprefix("module."): v for k, v in sd.items()}
+        if any(k.startswith("raft.") for k in sd):
+            sd = {k.removeprefix("raft."): v for k, v in sd.items() if k.startswith("raft.")}
 
         missing, unexpected = model.load_state_dict(sd, strict=False)
         if missing:
@@ -173,8 +201,8 @@ class StereoWindsModule(LightningModule):
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """Run 4x RAFT + solver.  Returns dict with h, chi2, x_sol.
 
-        When training (test_mode=False), also returns per-iteration solutions
-        in ``iter_results`` for multi-iteration loss.
+        Always uses the final RAFT iteration's flow (test_mode=True). The
+        loss is applied only to this final flow.
         """
         a0 = batch["A0"]
         a_minus = batch["A_minus"]
@@ -183,32 +211,15 @@ class StereoWindsModule(LightningModule):
         b_plus = batch["B_plus"]
         H_mat = batch["H_matrix"]
 
-        is_training = self.training
+        # 4 RAFT forward passes — only the final iteration's flow
+        d1 = self.raft(a0, a_minus, iters=self.iters, test_mode=True)[0]
+        d2 = self.raft(a0, a_plus,  iters=self.iters, test_mode=True)[0]
+        d3 = self.raft(a0, b_minus, iters=self.iters, test_mode=True)[0]
+        d4 = self.raft(a0, b_plus,  iters=self.iters, test_mode=True)[0]
 
-        # 4 RAFT forward passes
-        d1_all = self.raft(a0, a_minus, iters=self.iters, test_mode=not is_training)
-        d2_all = self.raft(a0, a_plus,  iters=self.iters, test_mode=not is_training)
-        d3_all = self.raft(a0, b_minus, iters=self.iters, test_mode=not is_training)
-        d4_all = self.raft(a0, b_plus,  iters=self.iters, test_mode=not is_training)
-
-        if not is_training:
-            # Inference: single final flow
-            y = self._flows_to_y(d1_all[0], d2_all[0], d3_all[0], d4_all[0])
-            x_sol, chi2 = self.solver(y, H_mat)
-            return {"h": x_sol[..., 0], "chi2": chi2, "x_sol": x_sol, "y": y}
-
-        # Training: solve at each RAFT iteration for multi-iteration loss
-        n_iters = len(d1_all)
-        iter_results = []
-        for i in range(n_iters):
-            y_i = self._flows_to_y(d1_all[i], d2_all[i], d3_all[i], d4_all[i])
-            x_sol_i, chi2_i = self.solver(y_i, H_mat)
-            iter_results.append({"h": x_sol_i[..., 0], "chi2": chi2_i, "x_sol": x_sol_i, "y": y_i})
-
-        # Final iteration is the primary output
-        final = iter_results[-1]
-        final["iter_results"] = iter_results
-        return final
+        y = self._flows_to_y(d1, d2, d3, d4)
+        x_sol, chi2 = self.solver(y, H_mat)
+        return {"h": x_sol[..., 0], "chi2": chi2, "x_sol": x_sol, "y": y}
 
     def _forward_ref(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """Run frozen pretrained RAFT + solver. Returns x_sol (no grad)."""
@@ -230,13 +241,20 @@ class StereoWindsModule(LightningModule):
         x_sol, _ = self.solver(y_ref, batch["H_matrix"])
         return x_sol
 
-    def _compute_iter_loss(self, h, chi2, batch):
-        """Compute RSS + EC loss for a single RAFT iteration's output."""
+    def _compute_iter_loss(self, iter_out, batch):
+        """Compute RSS + EC + sonde loss for a single RAFT iteration's output.
+
+        ``iter_out`` is the dict from ``forward`` containing ``h``, ``chi2``,
+        ``x_sol``. Returns (total, rss, ec, sonde) for logging.
+        """
+        h = iter_out["h"]
+        chi2 = iter_out["chi2"]
+        x_sol = iter_out["x_sol"]
         valid = torch.isfinite(chi2) & torch.isfinite(h)
 
-        # RSS loss
+        # RSS loss (weighted; 0 disables it but still keeps grad alive)
         if valid.any():
-            rss_loss = chi2[valid].mean()
+            rss_loss = chi2[valid].mean() * self.rss_weight
         else:
             rss_loss = chi2.sum() * 0
 
@@ -246,7 +264,6 @@ class StereoWindsModule(LightningModule):
             ec_mask = batch["ec_mask"]
             if ec_mask.any():
                 if "ec_layer_tops" in batch:
-                    # Cloud containment: zero loss inside cloud, Huber outside
                     ec_loss = self.ec_layer_loss_fn(
                         h / 1000,
                         batch["ec_layer_tops"] / 1000,
@@ -255,32 +272,44 @@ class StereoWindsModule(LightningModule):
                         ec_mask,
                     ) * self.ec_weight
                 else:
-                    # Single CTH fallback
                     ec_height = batch["ec_height"]
                     ec_loss = self.ec_loss_fn(
                         h / 1000, ec_height / 1000, ec_mask,
                     ) * self.ec_weight
 
-        return rss_loss + ec_loss, rss_loss, ec_loss
+        # IGRA sonde wind supervision (sparse)
+        sonde_loss = torch.tensor(0.0, device=h.device)
+        if self.sonde_weight > 0 and "sonde_pixel_mask" in batch:
+            pixel_mask = batch["sonde_pixel_mask"]
+            if pixel_mask.any():
+                # V_u, V_v are pixels per second from the differentiable solver
+                # Convert to m/s using per-pixel ground scale (dt = 1.0 sec)
+                v_u = x_sol[..., 3]
+                v_v = x_sol[..., 4]
+                u_pred = v_u * batch["dx_m"]
+                v_pred = v_v * batch["dy_m"]
+                sonde_loss = self.sonde_loss_fn(
+                    h_pred=h,
+                    u_pred=u_pred,
+                    v_pred=v_pred,
+                    sonde_h=batch["sonde_h"],
+                    sonde_u=batch["sonde_u"],
+                    sonde_v=batch["sonde_v"],
+                    sonde_mask=batch["sonde_mask"],
+                    pixel_mask=pixel_mask,
+                ) * self.sonde_weight
+
+        return rss_loss + ec_loss + sonde_loss, rss_loss, ec_loss, sonde_loss
 
     def training_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         out = self.forward(batch)
         h = out["h"]
         chi2 = out["chi2"]
-        iter_results = out.get("iter_results", [out])
 
-        # Multi-iteration loss with exponential weighting (γ=0.8)
-        gamma = 0.8
-        n_iters = len(iter_results)
-        total_iter_loss = torch.tensor(0.0, device=h.device)
-        for i, ir in enumerate(iter_results):
-            weight = gamma ** (n_iters - 1 - i)
-            iter_loss, _, _ = self._compute_iter_loss(ir["h"], ir["chi2"], batch)
-            total_iter_loss = total_iter_loss + weight * iter_loss
+        # Loss only on the final RAFT iteration's flow
+        total_iter_loss, rss_loss, ec_loss, sonde_loss = self._compute_iter_loss(out, batch)
 
-        # Final iteration stats for logging
         valid = torch.isfinite(chi2) & torch.isfinite(h)
-        _, rss_loss, ec_loss = self._compute_iter_loss(h, chi2, batch)
 
         # Physical bounds penalty (on final iteration only)
         if valid.any():
@@ -320,6 +349,7 @@ class StereoWindsModule(LightningModule):
                 ) * self.wind_reg_weight
 
         ec_count = int(batch["ec_mask"].sum()) if "ec_mask" in batch else 0
+        sonde_count = int(batch["sonde_pixel_mask"].sum()) if "sonde_pixel_mask" in batch else 0
         loss = total_iter_loss + bounds_penalty + h_reg_loss + wind_reg_loss
 
         # Logging (final iteration values)
@@ -329,6 +359,8 @@ class StereoWindsModule(LightningModule):
         self.log("train/wind_reg_loss", wind_reg_loss)
         self.log("train/ec_loss", ec_loss)
         self.log("train/ec_count", float(ec_count))
+        self.log("train/sonde_loss", sonde_loss)
+        self.log("train/sonde_count", float(sonde_count))
         self.log("train/total_loss", loss, prog_bar=True)
         self.log("train/valid_frac", valid.float().mean())
         if valid.any():

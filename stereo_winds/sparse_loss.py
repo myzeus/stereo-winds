@@ -140,3 +140,153 @@ class SparseHuberLoss(nn.Module):
         linear = abs_diff - quadratic
         loss = 0.5 * quadratic.pow(2) / self.delta + linear
         return loss.mean()
+
+
+class SparseWindLoss(nn.Module):
+    """Match predicted (u, v) to a sonde wind profile, optionally
+    interpolated to the predicted height.
+
+    For each labeled pixel, two matching modes:
+
+    - **closest**: pick the sonde level whose geopotential height is closest
+      to ``h_pred`` and compute loss against its (u, v). Gradient w.r.t. h_pred
+      is zero (the chosen level is selected by argmin).
+
+    - **interp** (default): linearly interpolate (u, v) between the bracketing
+      sonde levels (one above and one below ``h_pred``) at exactly h_pred.
+      The interpolation weight is differentiable in h_pred, so gradient flows
+      through the height too — the model learns "if I want to match this
+      wind, I need to predict the right height." Pixels without bracketing
+      levels are skipped.
+
+    Parameters
+    ----------
+    loss_type : 'huber' or 'rmsvd' (default 'huber')
+        - 'huber': mean of Huber(du) + Huber(dv) at labeled pixels
+        - 'rmsvd': sqrt(mean(du² + dv²)) at labeled pixels
+    delta : Huber threshold in m/s (default 5.0). Only used for 'huber'.
+    require_bracket : if True, only compute loss at pixels where the sonde
+        profile has a level above and below h_pred (default True)
+    match_mode : 'closest' or 'interp' (default 'interp')
+    """
+
+    def __init__(
+        self,
+        delta: float = 5.0,
+        require_bracket: bool = True,
+        loss_type: str = "huber",
+        match_mode: str = "interp",
+    ):
+        super().__init__()
+        self.delta = delta
+        self.require_bracket = require_bracket
+        if loss_type not in ("huber", "rmsvd"):
+            raise ValueError(f"loss_type must be 'huber' or 'rmsvd', got {loss_type}")
+        if match_mode not in ("closest", "interp"):
+            raise ValueError(f"match_mode must be 'closest' or 'interp', got {match_mode}")
+        self.loss_type = loss_type
+        self.match_mode = match_mode
+
+    def forward(
+        self,
+        h_pred: torch.Tensor,
+        u_pred: torch.Tensor,
+        v_pred: torch.Tensor,
+        sonde_h: torch.Tensor,
+        sonde_u: torch.Tensor,
+        sonde_v: torch.Tensor,
+        sonde_mask: torch.Tensor,
+        pixel_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        h_pred : (B, H, W) predicted height in meters
+        u_pred, v_pred : (B, H, W) predicted wind in m/s
+        sonde_h : (B, H, W, K) sonde heights at K levels (m)
+        sonde_u, sonde_v : (B, H, W, K) sonde winds at those levels (m/s)
+        sonde_mask : (B, H, W, K) bool, which levels are valid
+        pixel_mask : (B, H, W) bool, which pixels have any sonde label
+
+        Returns
+        -------
+        Scalar Huber loss in m/s, or 0 if no labels.
+        """
+        if not pixel_mask.any():
+            return torch.tensor(0.0, device=h_pred.device, dtype=h_pred.dtype)
+
+        h_p = h_pred.unsqueeze(-1)  # (B, H, W, 1)
+        INF = torch.tensor(float("inf"), device=h_pred.device)
+
+        if self.match_mode == "interp":
+            # Linear interpolation between bracketing sonde levels.
+            # NaN-safe: replace NaN sonde values with 0 before all arithmetic
+            # so non-labeled pixels don't propagate NaN through gradients.
+            # The eff_mask filters them out at loss time anyway.
+            sonde_h_safe = torch.nan_to_num(sonde_h, nan=0.0)
+            sonde_u_safe = torch.nan_to_num(sonde_u, nan=0.0)
+            sonde_v_safe = torch.nan_to_num(sonde_v, nan=0.0)
+
+            below = sonde_mask & (sonde_h_safe <= h_p)
+            above = sonde_mask & (sonde_h_safe > h_p)
+            has_bracket = below.any(dim=-1) & above.any(dim=-1)
+
+            # Below: pick the level with the largest height (closest from below)
+            neg_inf = torch.full_like(sonde_h_safe, float("-inf"))
+            pos_inf = torch.full_like(sonde_h_safe, float("inf"))
+            h_below = torch.where(below, sonde_h_safe, neg_inf)
+            below_idx = h_below.argmax(dim=-1, keepdim=True)
+            h_above = torch.where(above, sonde_h_safe, pos_inf)
+            above_idx = h_above.argmin(dim=-1, keepdim=True)
+
+            hb = sonde_h_safe.gather(-1, below_idx).squeeze(-1)
+            ha = sonde_h_safe.gather(-1, above_idx).squeeze(-1)
+            ub = sonde_u_safe.gather(-1, below_idx).squeeze(-1)
+            ua = sonde_u_safe.gather(-1, above_idx).squeeze(-1)
+            vb = sonde_v_safe.gather(-1, below_idx).squeeze(-1)
+            va = sonde_v_safe.gather(-1, above_idx).squeeze(-1)
+
+            # Robust denominator: clamp to a large positive value to avoid
+            # tiny/zero divisions producing huge or NaN gradients.
+            denom = (ha - hb).clamp(min=1.0)
+            w = ((h_pred - hb) / denom).clamp(0.0, 1.0)
+            u_match = (1.0 - w) * ub + w * ua
+            v_match = (1.0 - w) * vb + w * va
+
+            eff_mask = pixel_mask & has_bracket
+        else:
+            # Closest level (no gradient through h_pred)
+            dist = torch.where(sonde_mask, torch.abs(sonde_h - h_p), INF)
+            closest_lev = dist.argmin(dim=-1)
+            idx = closest_lev.unsqueeze(-1)
+            u_match = sonde_u.gather(-1, idx).squeeze(-1)
+            v_match = sonde_v.gather(-1, idx).squeeze(-1)
+            valid_match = sonde_mask.gather(-1, idx).squeeze(-1)
+            eff_mask = pixel_mask & valid_match
+            if self.require_bracket:
+                above = sonde_mask & (sonde_h > h_p)
+                below = sonde_mask & (sonde_h < h_p)
+                has_bracket = above.any(dim=-1) & below.any(dim=-1)
+                eff_mask = eff_mask & has_bracket
+
+        if not eff_mask.any():
+            return torch.tensor(0.0, device=h_pred.device, dtype=h_pred.dtype)
+
+        du = u_pred[eff_mask] - u_match[eff_mask]
+        dv = v_pred[eff_mask] - v_match[eff_mask]
+
+        if self.loss_type == "rmsvd":
+            # sqrt(mean(du² + dv²)) — matches the validation metric.
+            # Add a small epsilon for gradient stability when du, dv → 0.
+            sq = du.pow(2) + dv.pow(2)
+            return torch.sqrt(sq.mean() + 1e-8)
+
+        # Default: Huber on each component, summed and averaged
+        def huber(x, delta):
+            ax = torch.abs(x)
+            quad = torch.clamp(ax, max=delta)
+            lin = ax - quad
+            return 0.5 * quad.pow(2) / delta + lin
+
+        loss = (huber(du, self.delta) + huber(dv, self.delta)).mean()
+        return loss

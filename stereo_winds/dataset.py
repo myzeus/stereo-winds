@@ -452,3 +452,254 @@ class EarthCAREDataset(Dataset):
             "ec_layer_bases": torch.from_numpy(ec_layer_bases),
             "ec_layer_mask": torch.from_numpy(ec_layer_mask),
         }
+
+
+class IGRADataset(Dataset):
+    """Training dataset driven by IGRA radiosonde collocations.
+
+    Each sample is a 5-scene stereo patch centered on a sonde station,
+    with the full sonde profile (multiple pressure levels) scattered into
+    the station's pixel as labels.
+
+    Parameters
+    ----------
+    sat_a_zarr, sat_b_zarr : Zarr store paths (single store each — use
+        ``ConcatDataset`` to combine months)
+    parallax_path : precomputed parallax vectors
+    valid_mask_path : overlap mask
+    igra_collocation_path : parquet from ``scripts/collocate_igra.py``
+    patch_size : spatial crop size (default 512)
+    dt_minutes : temporal offset (default 10)
+    val_fraction : fraction of stations to hold out for validation (by
+        deterministic hash on station_idx). Default 0.2.
+    train : if True, use training stations; if False, use held-out
+        validation stations.
+    seed : random seed
+    """
+
+    def __init__(
+        self,
+        sat_a_zarr: str | Path | list[str | Path],
+        sat_b_zarr: str | Path | list[str | Path],
+        parallax_path: str | Path,
+        valid_mask_path: str | Path,
+        igra_collocation_path: str | Path,
+        patch_size: int = PATCH_SIZE,
+        dt_minutes: float = DT_MINUTES,
+        val_fraction: float = 0.2,
+        train: bool = True,
+        label_radius: int = 0,
+        seed: int | None = None,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.dt_minutes = dt_minutes
+        self._label_radius = label_radius
+
+        # Support single pair or list of (sat_a, sat_b) pairs for multi-band.
+        # When multiple pairs are given, each __getitem__ randomly selects one.
+        if isinstance(sat_a_zarr, (str, Path)):
+            sat_a_zarr = [sat_a_zarr]
+            sat_b_zarr = [sat_b_zarr]
+        self._band_pairs = []
+        for a, b in zip(sat_a_zarr, sat_b_zarr):
+            ds_a = xr.open_dataset(str(a), engine="zarr", chunks={})
+            ds_b = xr.open_dataset(str(b), engine="zarr", chunks={})
+            self._band_pairs.append((ds_a, ds_b))
+        logger.info("IGRADataset: %d band pair(s)", len(self._band_pairs))
+
+        # For backward compat (single pair access)
+        self.ds_a = self._band_pairs[0][0]
+        self.ds_b = self._band_pairs[0][1]
+
+        # Valid times: based on the first (primary) band pair.
+        # Other bands are tried randomly at __getitem__ time with fallback.
+        valid_times_set = set(build_triplet_index(
+            [sat_a_zarr[0]], [sat_b_zarr[0]], dt_minutes,
+        ))
+
+        par = np.load(parallax_path)
+        self.w_u = par["w_u"]
+        self.w_v = par["w_v"]
+        self.valid_mask = np.load(valid_mask_path)
+        n_rows, n_cols = self.valid_mask.shape
+
+        # Precompute per-pixel ground scale (m per pixel) for GOES-19
+        from .config import GOES19_CONFIG
+        from .navigation import compute_pixel_scale
+        self._dx_m, self._dy_m = compute_pixel_scale(GOES19_CONFIG)
+
+        # Load IGRA collocation parquet
+        import pandas as pd
+        ec_df = pd.read_parquet(igra_collocation_path)
+        logger.info(
+            "IGRA: %d rows, %d stations, %d sonde times",
+            len(ec_df), ec_df["station_idx"].nunique(), ec_df["goes_time"].nunique(),
+        )
+
+        # Train/val split by station hash
+        all_stations = np.array(sorted(ec_df["station_idx"].unique()))
+        is_val = np.array([(int(s) % 5 == 0) for s in all_stations])
+        if train:
+            keep_stations = set(int(s) for s in all_stations[~is_val])
+        else:
+            keep_stations = set(int(s) for s in all_stations[is_val])
+        ec_df = ec_df[ec_df["station_idx"].isin(keep_stations)]
+        logger.info(
+            "IGRA: %s split → %d stations",
+            "train" if train else "val", ec_df["station_idx"].nunique(),
+        )
+
+        # Group profiles by (goes_time, station_idx) → list of pressure levels
+        ps = patch_size
+        half = ps // 2
+
+        # Each sample: (goes_time, r0, c0, local_row, local_col, station_idx)
+        self._samples: list[tuple[np.datetime64, int, int, int, int, int]] = []
+        self._profiles: dict[tuple[np.datetime64, int], np.ndarray] = {}
+
+        for (gtime, sidx), grp in ec_df.groupby(["goes_time", "station_idx"]):
+            t64 = np.datetime64(gtime)
+            if t64 not in valid_times_set:
+                continue
+            row = int(grp["row_19"].iloc[0])
+            col = int(grp["col_19"].iloc[0])
+            # Sanity-check: a centered patch should mostly land in the
+            # valid overlap region. Final origin is randomized at __getitem__.
+            r0_c = max(0, min(row - half, n_rows - ps))
+            c0_c = max(0, min(col - half, n_cols - ps))
+            if self.valid_mask[r0_c:r0_c + ps, c0_c:c0_c + ps].mean() < 0.3:
+                continue
+            # Store the absolute station pixel; random offset is applied per-getitem.
+            self._samples.append((t64, row, col, int(sidx)))
+            # Store profile (heights, u, v) sorted by descending pressure
+            prof = grp.sort_values("pressure_hpa", ascending=False)
+            self._profiles[(t64, int(sidx))] = np.stack([
+                prof["height_m"].values.astype(np.float32),
+                prof["u"].values.astype(np.float32),
+                prof["v"].values.astype(np.float32),
+            ], axis=1)  # (n_levels, 3)
+
+        # Fixed K_max ensures consistent shapes across months when used in
+        # ConcatDataset (otherwise collate_fn fails to stack samples)
+        self._k_max = 16  # IGRA standard pressure levels
+        logger.info(
+            "IGRA dataset: %d samples, max %d pressure levels per profile",
+            len(self._samples), self._k_max,
+        )
+        self.rng = np.random.default_rng(seed)
+
+    def __len__(self) -> int:
+        return len(self._samples)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        try:
+            return self._getitem_inner(idx)
+        except RuntimeError as e:
+            if "decompression" in str(e).lower():
+                logger.warning("Corrupt chunk at idx %d, sampling replacement", idx)
+                alt = self.rng.integers(len(self._samples))
+                return self._getitem_inner(alt)
+            raise
+
+    def _getitem_inner(self, idx: int) -> dict[str, torch.Tensor]:
+        t0, row, col, sidx = self._samples[idx]
+        ps = self.patch_size
+        delta = np.timedelta64(int(self.dt_minutes), "m")
+
+        # Random patch origin so the labeled pixel can land anywhere with at
+        # least ``margin`` pixels from each edge.
+        margin = 32
+        n_rows, n_cols = self.valid_mask.shape
+        r0_min = max(0, row - (ps - margin) + 1)
+        r0_max = min(n_rows - ps, row - margin)
+        c0_min = max(0, col - (ps - margin) + 1)
+        c0_max = min(n_cols - ps, col - margin)
+        if r0_max < r0_min or c0_max < c0_min:
+            r0 = max(0, min(row - ps // 2, n_rows - ps))
+            c0 = max(0, min(col - ps // 2, n_cols - ps))
+        else:
+            r0 = int(self.rng.integers(r0_min, r0_max + 1))
+            c0 = int(self.rng.integers(c0_min, c0_max + 1))
+        lr = row - r0
+        lc = col - c0
+
+        # Randomly select a band pair (multi-band augmentation).
+        # Fall back to the first (primary) pair if the random band doesn't
+        # have data at this time.
+        y_sl = slice(r0, r0 + ps)
+        x_sl = slice(c0, c0 + ps)
+
+        def _load(ds, t):
+            return ds.Rad.sel(time=t).isel(y=y_sl, x=x_sl).values.astype(np.float32)
+
+        order = self.rng.permutation(len(self._band_pairs))
+        for bp_idx in order:
+            ds_a, ds_b = self._band_pairs[bp_idx]
+            try:
+                a_minus = _histogram_equalize(_load(ds_a, t0 - delta))
+                a0      = _histogram_equalize(_load(ds_a, t0))
+                a_plus  = _histogram_equalize(_load(ds_a, t0 + delta))
+                b_minus = _histogram_equalize(_load(ds_b, t0 - delta))
+                b_plus  = _histogram_equalize(_load(ds_b, t0 + delta))
+                break
+            except KeyError:
+                continue
+        else:
+            raise RuntimeError(f"No band pair has data at {t0}")
+
+        w_u_patch = self.w_u[r0:r0 + ps, c0:c0 + ps]
+        w_v_patch = self.w_v[r0:r0 + ps, c0:c0 + ps]
+        H_matrix = build_design_matrix(
+            w_u_patch, w_v_patch,
+            dt_a_minus=-DT_SECONDS, dt_a_plus=DT_SECONDS,
+            dt_b_minus=-DT_SECONDS, dt_b_plus=DT_SECONDS,
+        ).astype(np.float32)
+
+        # Scatter sonde profile into the station's pixel
+        K = max(self._k_max, 1)
+        sonde_h = np.full((ps, ps, K), np.nan, dtype=np.float32)
+        sonde_u = np.full((ps, ps, K), np.nan, dtype=np.float32)
+        sonde_v = np.full((ps, ps, K), np.nan, dtype=np.float32)
+        sonde_mask = np.zeros((ps, ps, K), dtype=bool)
+        pixel_mask = np.zeros((ps, ps), dtype=bool)
+
+        prof = self._profiles[(t0, sidx)]
+        n_lev = min(prof.shape[0], K)
+
+        # Spread the sonde profile to a neighborhood around the station.
+        # Winds are spatially smooth at the ~10-20 km scale (~5-10 pixels),
+        # so nearby pixels share the same wind. This distributes the gradient
+        # across the neighborhood and prevents point-source artifacts (vertical
+        # line striping in the height/wind fields).
+        R = self._label_radius
+        for dr in range(-R, R + 1):
+            for dc in range(-R, R + 1):
+                rr = lr + dr
+                cc = lc + dc
+                if 0 <= rr < ps and 0 <= cc < ps:
+                    sonde_h[rr, cc, :n_lev] = prof[:n_lev, 0]
+                    sonde_u[rr, cc, :n_lev] = prof[:n_lev, 1]
+                    sonde_v[rr, cc, :n_lev] = prof[:n_lev, 2]
+                    sonde_mask[rr, cc, :n_lev] = True
+                    pixel_mask[rr, cc] = True
+
+        # Per-pixel ground scale at the station (m per pixel)
+        dx_m_patch = self._dx_m[r0:r0 + ps, c0:c0 + ps].astype(np.float32)
+        dy_m_patch = self._dy_m[r0:r0 + ps, c0:c0 + ps].astype(np.float32)
+
+        return {
+            "A_minus": torch.from_numpy(a_minus).unsqueeze(0),
+            "A0":      torch.from_numpy(a0).unsqueeze(0),
+            "A_plus":  torch.from_numpy(a_plus).unsqueeze(0),
+            "B_minus": torch.from_numpy(b_minus).unsqueeze(0),
+            "B_plus":  torch.from_numpy(b_plus).unsqueeze(0),
+            "H_matrix": torch.from_numpy(H_matrix),
+            "sonde_h": torch.from_numpy(sonde_h),
+            "sonde_u": torch.from_numpy(sonde_u),
+            "sonde_v": torch.from_numpy(sonde_v),
+            "sonde_mask": torch.from_numpy(sonde_mask),
+            "sonde_pixel_mask": torch.from_numpy(pixel_mask),
+            "dx_m": torch.from_numpy(dx_m_patch),
+            "dy_m": torch.from_numpy(dy_m_patch),
+        }
