@@ -467,6 +467,10 @@ def main():
                         help="Remap onto this satellite's grid (e.g. goes19)")
     parser.add_argument("--monthly", action="store_true",
                         help="Partition into monthly Zarr files (e.g. _202601.zarr)")
+    parser.add_argument("--times-file", default=None,
+                        help="Path to a text file with one ISO timestamp per line. "
+                             "If provided, only these timestamps are processed (overrides "
+                             "--start/--end/--cadence).")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -482,7 +486,16 @@ def main():
     cache_dir.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    timestamps = generate_timestamps(start, end, args.cadence)
+    if args.times_file:
+        with open(args.times_file) as f:
+            timestamps = [
+                dt.datetime.fromisoformat(line.strip())
+                for line in f if line.strip() and not line.startswith("#")
+            ]
+        # Filter to the requested month range so monthly partitioning works
+        timestamps = [t for t in timestamps if start <= t < end]
+    else:
+        timestamps = generate_timestamps(start, end, args.cadence)
     logger.info("GOES Zarr Cube Builder")
     logger.info("  Satellite: %s", args.satellite)
     logger.info("  Band: %s", args.band)

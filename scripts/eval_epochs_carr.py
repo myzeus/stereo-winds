@@ -61,8 +61,11 @@ print(f"{'Label':45s}  {'N':>6s}  {'H_RMSE':>7s}  {'H_bias':>7s}  {'H_corr':>6s}
 print("-" * 100)
 
 
+TILE_SIZE = int(os.environ.get("TILE_SIZE", "512"))
+TILE_OVERLAP = TILE_SIZE // 2
+
 def evalck(ckpt_path, label):
-    disp = StereoDisparity(model_ckpt_path=ckpt_path, tile_size=512, overlap=256, batch_size=8, device="cuda")
+    disp = StereoDisparity(model_ckpt_path=ckpt_path, tile_size=TILE_SIZE, overlap=TILE_OVERLAP, batch_size=8, device="cuda")
     flows = disp.compute_all(images)
     for k in flows:
         flows[k][:, ~valid] = np.nan
