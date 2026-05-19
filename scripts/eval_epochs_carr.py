@@ -57,12 +57,21 @@ ds.close()
 cg = (cdqf == 0) & np.isfinite(ch) & np.isfinite(cu) & np.isfinite(cv) & (ch >= 0) & (ch <= 20000)
 QA = dict(chi2_max=0.2, sigma_h_max=5000., h_grad_max=3000., wind_speed_max=100., w_mag_min=0.0003)
 
-print(f"{'Label':45s}  {'N':>6s}  {'H_RMSE':>7s}  {'H_bias':>7s}  {'H_corr':>6s}  {'RMSVD':>7s}  {'SpBias':>7s}")
-print("-" * 100)
-
-
 TILE_SIZE = int(os.environ.get("TILE_SIZE", "512"))
 TILE_OVERLAP = TILE_SIZE // 2
+
+H_BINS = [(0, 3000), (3000, 6000), (6000, 12000), (12000, 20000)]
+P_BINS = [(0, 1), (1, 3), (3, 6), (6, 12), (12, 99)]
+
+# Pre-compute Carr collocation pixels using Carr's reported height (parallax-correct)
+g = cg
+xa_pre, ya_pre = geodetic_to_fixed_grid(cl[g], clo[g], sat_a, h_m=ch[g])
+cf_pre, rf_pre = scanning_angle_to_pixel(xa_pre, ya_pre, sat_a)
+ci_pre = np.clip(np.round(cf_pre).astype(int), 0, sat_a.n_cols - 1)
+ri_pre = np.clip(np.round(rf_pre).astype(int), 0, sat_a.n_rows - 1)
+ib_pre = (cf_pre >= 0) & (cf_pre < sat_a.n_cols) & (rf_pre >= 0) & (rf_pre < sat_a.n_rows) & np.isfinite(cf_pre)
+chh_g, cuh_g, cvh_g = ch[g], cu[g], cv[g]
+
 
 def evalck(ckpt_path, label):
     disp = StereoDisparity(model_ckpt_path=ckpt_path, tile_size=TILE_SIZE, overlap=TILE_OVERLAP, batch_size=8, device="cuda")
@@ -82,22 +91,42 @@ def evalck(ckpt_path, label):
           & np.isfinite(sol["sigma_h"]) & (sol["sigma_h"] <= QA["sigma_h_max"])
           & (grad <= QA["h_grad_max"]) & np.isfinite(spd) & (spd <= QA["wind_speed_max"])
           & (wm >= QA["w_mag_min"]))
-    g = cg
-    xa, ya = geodetic_to_fixed_grid(cl[g], clo[g], sat_a, h_m=0.)
-    cf, rf = scanning_angle_to_pixel(xa, ya, sat_a)
-    ci, ri = np.round(cf).astype(int), np.round(rf).astype(int)
-    ib = (ci >= 0) & (ci < sat_a.n_cols) & (ri >= 0) & (ri < sat_a.n_rows) & np.isfinite(cf)
-    ci, ri = np.clip(ci, 0, sat_a.n_cols - 1), np.clip(ri, 0, sat_a.n_rows - 1)
-    ok = ib & (qf[ri, ci] > 0) & np.isfinite(h[ri, ci]) & np.isfinite(u_ms[ri, ci]) & qa[ri, ci]
-    n = ok.sum()
-    m = dict(ch=ch[g][ok], cu=cu[g][ok], cv=cv[g][ok],
-             ah=h[ri[ok], ci[ok]], au=u_ms[ri[ok], ci[ok]], av=v_ms[ri[ok], ci[ok]])
-    hr = height_rmse(m["ah"], m["ch"])
-    hb = float(np.mean(m["ah"] - m["ch"]))
-    rv = rmsvd(m["au"], m["av"], m["cu"], m["cv"])
-    sb = speed_bias(m["au"], m["av"], m["cu"], m["cv"])
-    hc = correlation(m["ah"], m["ch"])
-    print(f"{label:45s}  {n:>6,}  {hr:>7.0f}m  {hb:>+7.0f}m  {hc:>6.4f}  {rv:>6.2f}m/s  {sb:>+6.2f}m/s")
+
+    D1, D2, D3, D4 = flows["D1"], flows["D2"], flows["D3"], flows["D4"]
+    emp_par_u = ((D3[0] + D4[0]) / 2) - ((D1[0] + D2[0]) / 2)
+    emp_par_v = ((D3[1] + D4[1]) / 2) - ((D1[1] + D2[1]) / 2)
+    emp_par = np.sqrt(emp_par_u**2 + emp_par_v**2)
+
+    ok = ib_pre & (qf[ri_pre, ci_pre] > 0) & np.isfinite(h[ri_pre, ci_pre]) & np.isfinite(u_ms[ri_pre, ci_pre]) & qa[ri_pre, ci_pre]
+
+    def _row(mask, prefix):
+        if mask.sum() < 30:
+            return f"  {prefix}  N={mask.sum():>5}  (too few)"
+        ah = h[ri_pre[mask], ci_pre[mask]]
+        au = u_ms[ri_pre[mask], ci_pre[mask]]
+        av = v_ms[ri_pre[mask], ci_pre[mask]]
+        chm, cum, cvm = chh_g[mask], cuh_g[mask], cvh_g[mask]
+        hr = height_rmse(ah, chm)
+        hb = float(np.mean(ah - chm))
+        rv = rmsvd(au, av, cum, cvm)
+        sb = speed_bias(au, av, cum, cvm)
+        return f"  {prefix}  N={mask.sum():>6,}  H_RMSE={hr:>5.0f}m  H_bias={hb:>+6.0f}m  RMSVD={rv:>5.2f}  SpBias={sb:>+5.2f}"
+
+    print(f"\n{label}")
+    print(_row(ok, "all     "))
+    for lo, hi in H_BINS:
+        m = ok & (chh_g >= lo) & (chh_g < hi)
+        print(_row(m, f"h={lo/1000:>2.0f}-{hi/1000:>2.0f}km"))
+
+    # Empirical parallax distribution at high-cloud subset (where stereo matters most)
+    hi_subset = ok & (chh_g >= 6000) & (chh_g < 12000)
+    if hi_subset.sum() > 0:
+        ep_pts = emp_par[ri_pre, ci_pre]
+        bin_counts = []
+        for lo, hi in P_BINS:
+            bin_counts.append(((ep_pts >= lo) & (ep_pts < hi) & hi_subset).sum())
+        print(f"  6-12km |p| distribution:  " + "  ".join(
+            f"{lo}-{hi}px:{c}" for (lo, hi), c in zip(P_BINS, bin_counts)))
 
 
 # Pretrained baseline

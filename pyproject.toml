@@ -19,6 +19,8 @@ dependencies = [
     "filelock>=3.12",
     "mpi4py>=4.0",
     "zarr>=3.0",
+    "pandas>=2.0",
+    "pyorbital>=1.7",
 ]
 
 [project.optional-dependencies]

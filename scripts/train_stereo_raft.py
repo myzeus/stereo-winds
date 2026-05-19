@@ -92,7 +92,11 @@ if __name__ == "__main__":
                         help="Spread sonde labels to a (2R+1)x(2R+1) neighborhood (default 0 = single pixel)")
     parser.add_argument("--patch-size", type=int, default=128,
                         help="Training patch size (default 128, matching pretrained RAFT)")
+    parser.add_argument("--raft-ckpt", default=None,
+                        help="Override the RAFT init checkpoint (default: windflow.raft.202508.epoch254)")
     args = parser.parse_args()
+    if args.raft_ckpt:
+        RAFT_CKPT = args.raft_ckpt
 
     EC_WEIGHT = args.ec_weight if args.mode == "earthcare" else 0.0
     SONDE_WEIGHT = args.sonde_weight if args.mode == "sonde" else 0.0
