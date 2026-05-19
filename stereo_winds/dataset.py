@@ -554,9 +554,14 @@ class IGRADataset(Dataset):
         ps = patch_size
         half = ps // 2
 
-        # Each sample: (goes_time, r0, c0, local_row, local_col, station_idx)
-        self._samples: list[tuple[np.datetime64, int, int, int, int, int]] = []
+        # Each sample: (goes_time, row, col, station_idx) — the "primary" station
+        self._samples: list[tuple[np.datetime64, int, int, int]] = []
         self._profiles: dict[tuple[np.datetime64, int], np.ndarray] = {}
+
+        # Build a lookup: goes_time → list of (row, col, station_idx) for
+        # ALL stations at that time. Used in __getitem__ to scatter every
+        # station that falls within the randomized patch.
+        self._stations_by_time: dict[np.datetime64, list[tuple[int, int, int]]] = {}
 
         for (gtime, sidx), grp in ec_df.groupby(["goes_time", "station_idx"]):
             t64 = np.datetime64(gtime)
@@ -564,21 +569,30 @@ class IGRADataset(Dataset):
                 continue
             row = int(grp["row_19"].iloc[0])
             col = int(grp["col_19"].iloc[0])
-            # Sanity-check: a centered patch should mostly land in the
-            # valid overlap region. Final origin is randomized at __getitem__.
-            r0_c = max(0, min(row - half, n_rows - ps))
-            c0_c = max(0, min(col - half, n_cols - ps))
-            if self.valid_mask[r0_c:r0_c + ps, c0_c:c0_c + ps].mean() < 0.3:
-                continue
-            # Store the absolute station pixel; random offset is applied per-getitem.
-            self._samples.append((t64, row, col, int(sidx)))
-            # Store profile (heights, u, v) sorted by descending pressure
+
+            # Store profile
             prof = grp.sort_values("pressure_hpa", ascending=False)
             self._profiles[(t64, int(sidx))] = np.stack([
                 prof["height_m"].values.astype(np.float32),
                 prof["u"].values.astype(np.float32),
                 prof["v"].values.astype(np.float32),
-            ], axis=1)  # (n_levels, 3)
+            ], axis=1)
+
+            # Add to per-time station list
+            self._stations_by_time.setdefault(t64, []).append((row, col, int(sidx)))
+
+        # Build sample list: one sample per (time, primary_station)
+        for (gtime, sidx), grp in ec_df.groupby(["goes_time", "station_idx"]):
+            t64 = np.datetime64(gtime)
+            if t64 not in valid_times_set:
+                continue
+            row = int(grp["row_19"].iloc[0])
+            col = int(grp["col_19"].iloc[0])
+            r0_c = max(0, min(row - half, n_rows - ps))
+            c0_c = max(0, min(col - half, n_cols - ps))
+            if self.valid_mask[r0_c:r0_c + ps, c0_c:c0_c + ps].mean() < 0.3:
+                continue
+            self._samples.append((t64, row, col, int(sidx)))
 
         # Fixed K_max ensures consistent shapes across months when used in
         # ConcatDataset (otherwise collate_fn fails to stack samples)
@@ -656,7 +670,8 @@ class IGRADataset(Dataset):
             dt_b_minus=-DT_SECONDS, dt_b_plus=DT_SECONDS,
         ).astype(np.float32)
 
-        # Scatter sonde profile into the station's pixel
+        # Scatter ALL sonde profiles that fall within this patch.
+        # A 512×512 patch covers ~1000 km and typically contains ~40 stations.
         K = max(self._k_max, 1)
         sonde_h = np.full((ps, ps, K), np.nan, dtype=np.float32)
         sonde_u = np.full((ps, ps, K), np.nan, dtype=np.float32)
@@ -664,25 +679,30 @@ class IGRADataset(Dataset):
         sonde_mask = np.zeros((ps, ps, K), dtype=bool)
         pixel_mask = np.zeros((ps, ps), dtype=bool)
 
-        prof = self._profiles[(t0, sidx)]
-        n_lev = min(prof.shape[0], K)
-
-        # Spread the sonde profile to a neighborhood around the station.
-        # Winds are spatially smooth at the ~10-20 km scale (~5-10 pixels),
-        # so nearby pixels share the same wind. This distributes the gradient
-        # across the neighborhood and prevents point-source artifacts (vertical
-        # line striping in the height/wind fields).
         R = self._label_radius
-        for dr in range(-R, R + 1):
-            for dc in range(-R, R + 1):
-                rr = lr + dr
-                cc = lc + dc
-                if 0 <= rr < ps and 0 <= cc < ps:
-                    sonde_h[rr, cc, :n_lev] = prof[:n_lev, 0]
-                    sonde_u[rr, cc, :n_lev] = prof[:n_lev, 1]
-                    sonde_v[rr, cc, :n_lev] = prof[:n_lev, 2]
-                    sonde_mask[rr, cc, :n_lev] = True
-                    pixel_mask[rr, cc] = True
+        for st_row, st_col, st_idx in self._stations_by_time.get(t0, []):
+            # Check if this station falls within the current patch
+            sl_r = st_row - r0
+            sl_c = st_col - c0
+            if not (0 <= sl_r < ps and 0 <= sl_c < ps):
+                continue
+            prof_key = (t0, st_idx)
+            if prof_key not in self._profiles:
+                continue
+            prof = self._profiles[prof_key]
+            n_lev = min(prof.shape[0], K)
+
+            # Spread the sonde profile to a neighborhood around the station
+            for dr in range(-R, R + 1):
+                for dc in range(-R, R + 1):
+                    rr = sl_r + dr
+                    cc = sl_c + dc
+                    if 0 <= rr < ps and 0 <= cc < ps:
+                        sonde_h[rr, cc, :n_lev] = prof[:n_lev, 0]
+                        sonde_u[rr, cc, :n_lev] = prof[:n_lev, 1]
+                        sonde_v[rr, cc, :n_lev] = prof[:n_lev, 2]
+                        sonde_mask[rr, cc, :n_lev] = True
+                        pixel_mask[rr, cc] = True
 
         # Per-pixel ground scale at the station (m per pixel)
         dx_m_patch = self._dx_m[r0:r0 + ps, c0:c0 + ps].astype(np.float32)
