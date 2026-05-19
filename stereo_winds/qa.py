@@ -68,6 +68,7 @@ def compute_qa_flag(
         & valid_mask
         & np.isfinite(u) & np.isfinite(v)
         & (chi2 <= chi2_threshold)
+        & (speed <= 100.0)
     )
     qa[level1] = 1.0
 

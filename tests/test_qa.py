@@ -122,11 +122,19 @@ class TestComputeQaFlag:
         # sigma_h=1500 > 1000 threshold for high clouds -> level 1 only
         assert np.all(qa == 1.0)
 
-    def test_speed_over_100_stays_level1(self):
+    def test_speed_over_100_drops_to_level0(self):
         sol = self._make_solution(chi2=0.1, sigma_h=500.0, u=80.0, v=80.0)
         mask = np.ones((10, 10), dtype=bool)
         qa = compute_qa_flag(sol, mask)
-        # speed = sqrt(80^2+80^2) ~ 113 > 100 -> level 1
+        # speed = sqrt(80^2+80^2) ~ 113 > 100 -> rejected (level 0).
+        # 100 m/s is the broad-use cap; anything above is solver pathology.
+        assert np.all(qa == 0.0)
+
+    def test_speed_just_under_100_passes_level1(self):
+        sol = self._make_solution(chi2=5.0, sigma_h=5000.0, u=60.0, v=60.0)
+        mask = np.ones((10, 10), dtype=bool)
+        qa = compute_qa_flag(sol, mask)
+        # speed ~ 84.85 < 100, chi2=5 passes level 1, sigma_h=5000 fails level 2
         assert np.all(qa == 1.0)
 
     def test_monotonic_levels(self):
