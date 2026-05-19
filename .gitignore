@@ -1,0 +1,42 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtualenvs
+.venv/
+venv/
+env/
+
+# IDE / editor / agent state
+.idea/
+.vscode/
+.claude/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Project caches
+.stereo_cache/
+scripts/.stereo_cache/
+
+# Local data, outputs, and experiment artifacts
+cache/
+data/
+carr_data/
+output/
+eval_ckpts/
+images/
+images_old/
+
+# Training run logs
+wandb/
+*.log
+
+# Local notebooks scratch
+.ipynb_checkpoints/
