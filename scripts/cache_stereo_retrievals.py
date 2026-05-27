@@ -1,7 +1,12 @@
 """Run RAFT + solver on a set of scenes and cache results to a Zarr store.
 
-Caches u_wind, v_wind, cloud_top_height, chi_squared, sigma_h, quality_flag
-for each (time) so downstream evaluations can reuse them without re-running RAFT.
+Caches u_wind, v_wind, cloud_top_height, chi_squared, sigma_h, sigma_u,
+sigma_v, quality_flag for each (time) so downstream evaluations (and the
+single-satellite student distillation) can reuse them without re-running RAFT.
+
+Note: sigma_u/sigma_v come straight from the solver's velocity covariance and
+are therefore in PIXELS/SECOND, not m/s — multiply by the per-pixel ground
+scale (navigation.compute_pixel_scale) to convert. sigma_h is already meters.
 """
 
 import sys
@@ -15,8 +20,11 @@ sys.path.insert(0, os.path.join(BASE, "zeus"))
 import numpy as np
 import xarray as xr
 
-from stereo_winds.config import GOES19_CONFIG, GOES18_CONFIG
-from stereo_winds.solver import build_design_matrix, solve_stereo_winds, pixels_to_wind_ms
+from stereo_winds.config import SATELLITE_CONFIGS, GOES19_CONFIG, GOES18_CONFIG
+from stereo_winds.solver import (
+    build_design_matrix, compute_parallax_vectors, solve_stereo_winds,
+    pixels_to_wind_ms,
+)
 from stereo_winds.disparity import StereoDisparity
 from stereo_winds.time_model import compute_scene_times
 
@@ -31,9 +39,23 @@ def main():
     parser.add_argument("--out-dir", default=None, help="Output Zarr directory")
     parser.add_argument("--n-iter", type=int, default=1, help="Solver iterations")
     parser.add_argument("--lowmem", action="store_true", help="Use lowmem (serial) RAFT")
+    parser.add_argument("--data-dir", default=None,
+                        help="Override DATA_DIR (default: BASE/data/stereo_training)")
+    parser.add_argument("--sat-a-tag", default="goes19",
+                        choices=list(SATELLITE_CONFIGS.keys()),
+                        help="Sat-A id (also used in zarr filename pattern)")
+    parser.add_argument("--sat-b-tag", default="goes18",
+                        choices=list(SATELLITE_CONFIGS.keys()),
+                        help="Sat-B id (also used in zarr filename pattern)")
+    parser.add_argument("--band", default="C14",
+                        help="ABI band tag in zarr filename (default: C14)")
+    parser.add_argument("--parallax-cache", default=None,
+                        help="Optional override for the parallax LUT npz path "
+                             "(default: <data-dir>/parallax_<sat_a>_<sat_b>.npz). "
+                             "Computed on the fly if missing.")
     args = parser.parse_args()
 
-    DATA_DIR = os.path.join(BASE, "data", "stereo_training")
+    DATA_DIR = args.data_dir or os.path.join(BASE, "data", "stereo_training")
     out_dir = args.out_dir or os.path.join(BASE, "data", "stereo_cache")
     os.makedirs(out_dir, exist_ok=True)
     suffix = f"iter{args.n_iter}"
@@ -41,13 +63,25 @@ def main():
         suffix += "_lowmem"
     out_path = os.path.join(out_dir, f"{args.label}_{args.month}_{suffix}.zarr")
 
-    SAT_A = GOES19_CONFIG
-    SAT_B = GOES18_CONFIG
+    SAT_A = SATELLITE_CONFIGS[args.sat_a_tag]
+    SAT_B = SATELLITE_CONFIGS[args.sat_b_tag]
     DT_MINUTES = 10.0
 
-    # Parallax
-    pdata = np.load(os.path.join(DATA_DIR, "parallax_goes19_goes18.npz"))
-    w_u, w_v = pdata["w_u"], pdata["w_v"]
+    # Parallax — load cache, or compute on the fly
+    parallax_path = args.parallax_cache or os.path.join(
+        DATA_DIR, f"parallax_{args.sat_a_tag}_{args.sat_b_tag}.npz",
+    )
+    if os.path.exists(parallax_path):
+        print(f"Loading parallax cache: {parallax_path}", flush=True)
+        pdata = np.load(parallax_path)
+        w_u, w_v = pdata["w_u"], pdata["w_v"]
+    else:
+        print(f"Computing parallax {args.sat_a_tag} -> {args.sat_b_tag}...", flush=True)
+        w_u, w_v = compute_parallax_vectors(SAT_A, SAT_B)
+        if args.parallax_cache:
+            np.savez_compressed(parallax_path, w_u=w_u, w_v=w_v)
+            print(f"  Saved to {parallax_path}", flush=True)
+
     scene_times = compute_scene_times(None, DT_MINUTES, SAT_A, SAT_B)
     H_matrix = build_design_matrix(
         w_u, w_v,
@@ -56,8 +90,16 @@ def main():
     )
 
     # Load Zarr stores
-    ds_a = xr.open_zarr(os.path.join(DATA_DIR, f"goes19_C14_{args.month}.zarr"))
-    ds_b = xr.open_zarr(os.path.join(DATA_DIR, f"goes18_remap_goes19_C14_{args.month}.zarr"))
+    sat_a_zarr = os.path.join(
+        DATA_DIR, f"{args.sat_a_tag}_{args.band}_{args.month}.zarr",
+    )
+    sat_b_zarr = os.path.join(
+        DATA_DIR, f"{args.sat_b_tag}_remap_{args.sat_a_tag}_{args.band}_{args.month}.zarr",
+    )
+    print(f"Sat A: {sat_a_zarr}", flush=True)
+    print(f"Sat B: {sat_b_zarr}", flush=True)
+    ds_a = xr.open_zarr(sat_a_zarr)
+    ds_b = xr.open_zarr(sat_b_zarr)
     all_times_a = set(ds_a.time.values)
     all_times_b = set(ds_b.time.values)
     delta = np.timedelta64(10, "m")
@@ -91,6 +133,8 @@ def main():
     h_arr = np.full((n, H, W), np.nan, dtype=np.float32)
     chi2_arr = np.full((n, H, W), np.nan, dtype=np.float32)
     sigh_arr = np.full((n, H, W), np.nan, dtype=np.float32)
+    sigu_arr = np.full((n, H, W), np.nan, dtype=np.float32)
+    sigv_arr = np.full((n, H, W), np.nan, dtype=np.float32)
     qf_arr = np.zeros((n, H, W), dtype=np.float32)
 
     for ti, t0 in enumerate(eval_times):
@@ -119,6 +163,8 @@ def main():
         h_arr[ti] = sol["h"]
         chi2_arr[ti] = sol["chi2"]
         sigh_arr[ti] = sol["sigma_h"]
+        sigu_arr[ti] = sol["sigma_u"]
+        sigv_arr[ti] = sol["sigma_v"]
         qf = sol["quality_flag"].copy()
         qf[~valid] = 0.0
         qf_arr[ti] = qf
@@ -131,10 +177,15 @@ def main():
             "cloud_top_height": (("time", "y", "x"), h_arr),
             "chi_squared": (("time", "y", "x"), chi2_arr),
             "sigma_h": (("time", "y", "x"), sigh_arr),
+            "sigma_u": (("time", "y", "x"), sigu_arr),
+            "sigma_v": (("time", "y", "x"), sigv_arr),
             "quality_flag": (("time", "y", "x"), qf_arr),
         },
         coords={"time": np.array(eval_times)},
     )
+    out_ds["sigma_u"].attrs["units"] = "pixel s-1"
+    out_ds["sigma_v"].attrs["units"] = "pixel s-1"
+    out_ds["sigma_h"].attrs["units"] = "m"
     out_ds.to_zarr(out_path, mode="w")
     print(f"Saved to {out_path}", flush=True)
 

@@ -259,3 +259,29 @@ def compute_pixel_scale(
 
     _pixel_scale_cache[cache_key] = (dx_m, dy_m)
     return dx_m, dy_m
+
+
+def compute_grid_latlon(
+    sat: SatelliteConfig,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-pixel geodetic (lat_deg, lon_deg) for the full fixed grid.
+
+    NaN for off-Earth pixels.  Useful for building geometry feature
+    channels that let a single-satellite model generalize across the disk.
+    """
+    cols = np.arange(sat.n_cols, dtype=np.float64) * sat.scale_x + sat.x_offset
+    rows = np.arange(sat.n_rows, dtype=np.float64) * sat.scale_y + sat.y_offset
+    x2d, y2d = np.meshgrid(cols, rows)
+    return fixed_grid_to_geodetic(x2d, y2d, sat)
+
+
+def compute_grid_zenith(
+    sat: SatelliteConfig,
+) -> np.ndarray:
+    """Per-pixel satellite zenith angle (degrees) for the full fixed grid.
+
+    NaN for off-Earth pixels.  This is purely geometric (time-independent)
+    and satellite-relative, so the same routine works for any satellite.
+    """
+    lat, lon = compute_grid_latlon(sat)
+    return compute_zenith_angle(lat, lon, sat)

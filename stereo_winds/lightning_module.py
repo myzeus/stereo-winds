@@ -409,6 +409,10 @@ class StereoWindsModule(LightningModule):
         n_img: int = 8,
     ) -> None:
         """Log diagnostic image grids to W&B."""
+        # Skip if the active logger isn't W&B (CSVLogger/TensorBoardLogger
+        # don't have an `experiment.log({...})` for arbitrary media dicts).
+        if not hasattr(self.logger.experiment, "log"):
+            return
         B = min(batch["A0"].shape[0], n_img)
 
         def _colormap(arr, cmap, vmin, vmax):
