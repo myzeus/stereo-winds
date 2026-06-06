@@ -83,12 +83,49 @@ def neighborhood_median(grid, r_centers, c_centers, qa_mask, box=2):
     return med
 
 
-def evaluate_one_time(stereo, t_index, df_time):
+def _build_qa_mask(ds):
+    """Build the standard QA mask from a stereo dataset's solver outputs."""
+    h_g = ds["cloud_top_height"].values
+    u = ds["u_wind"].values
+    v = ds["v_wind"].values
+    chi2 = ds["chi_squared"].values
+    sigh = ds["sigma_h"].values
+    qf = ds["quality_flag"].values
+    grad = height_gradient(h_g)
+    spd = np.sqrt(u**2 + v**2)
+    return (
+        (qf > 0) & np.isfinite(h_g) & np.isfinite(chi2)
+        & (chi2 <= QA["chi2_max"])
+        & np.isfinite(sigh) & (sigh <= QA["sigma_h_max"])
+        & (grad <= QA["h_grad_max"])
+        & np.isfinite(spd) & (spd <= QA["wind_speed_max"])
+        & (h_g >= QA["min_height"]) & (h_g <= 20000)
+    )
+
+
+def _pad_mask_to_shape(local_mask, target_shape, row_offset, col_offset):
+    """Embed a cropped mask into a full-disk shape; False outside the crop."""
+    out = np.zeros(target_shape, bool)
+    h, w = local_mask.shape
+    out[row_offset:row_offset + h, col_offset:col_offset + w] = local_mask
+    return out
+
+
+def evaluate_one_time(stereo, t_index, df_time, row_offset=0, col_offset=0,
+                      qa_mask=None):
     """Evaluate one time step's stereo grid against sondes at `df_time`.
 
     stereo : xr.Dataset, single time slice (u_wind, v_wind, ...) loaded
     t_index : original time index (for logging only)
     df_time : parquet rows for goes_times within +/- 6h of stereo.time
+    row_offset, col_offset : full-disk → chunk-local index shift. Parquet
+        row_19/col_19 are full-disk goes-19 grid coordinates; cropped
+        chunks (e.g. data_10ir_3t_*) have a non-zero offset and need it
+        subtracted before indexing the local grid.
+    qa_mask : optional pre-computed (H, W) bool mask aligned to the stereo
+        grid. When supplied (e.g. derived from a teacher chunk's chi²),
+        overrides the in-grid QA construction; useful when evaluating a
+        student that doesn't emit its own chi².
 
     Returns a list of dicts (one per matched station) with keys:
         u_stereo, v_stereo, h_stereo,
@@ -101,20 +138,9 @@ def evaluate_one_time(stereo, t_index, df_time):
     u_grid = stereo["u_wind"].values
     v_grid = stereo["v_wind"].values
     h_grid = stereo["cloud_top_height"].values
-    chi2_grid = stereo["chi_squared"].values
-    sigh_grid = stereo["sigma_h"].values
-    qf_grid = stereo["quality_flag"].values
 
-    grad = height_gradient(h_grid)
-    spd = np.sqrt(u_grid**2 + v_grid**2)
-    qa_mask = (
-        (qf_grid > 0) & np.isfinite(h_grid) & np.isfinite(chi2_grid)
-        & (chi2_grid <= QA["chi2_max"])
-        & np.isfinite(sigh_grid) & (sigh_grid <= QA["sigma_h_max"])
-        & (grad <= QA["h_grad_max"])
-        & np.isfinite(spd) & (spd <= QA["wind_speed_max"])
-        & (h_grid >= QA["min_height"]) & (h_grid <= 20000)
-    )
+    if qa_mask is None:
+        qa_mask = _build_qa_mask(stereo)
 
     # Group by station to build profiles
     for (sidx,), grp in df_time.groupby(["station_idx"]):
@@ -130,8 +156,8 @@ def evaluate_one_time(stereo, t_index, df_time):
         if sonde_valid.sum() < 2:
             continue
 
-        r = int(prof["row_19"].iloc[0])
-        c = int(prof["col_19"].iloc[0])
+        r = int(prof["row_19"].iloc[0]) - row_offset
+        c = int(prof["col_19"].iloc[0]) - col_offset
         if not (0 <= r < h_grid.shape[0] and 0 <= c < h_grid.shape[1]):
             continue
 
@@ -176,8 +202,48 @@ def evaluate_one_time(stereo, t_index, df_time):
     return matches
 
 
-def evaluate_store(stereo_path, df, label):
-    """Evaluate a stereo store (zarr or netcdf) against the parquet."""
+def _scalar_int(v, default=0):
+    """Unwrap zarr v3 / xarray-serialized scalar ints (lists, ndarrays, etc.)."""
+    if v is None:
+        return default
+    for _ in range(6):
+        if hasattr(v, "tolist"):
+            v = v.tolist()
+        if isinstance(v, (list, tuple)):
+            if not v:
+                return default
+            v = v[0]
+        else:
+            break
+    return int(v)
+
+
+def _open_qa_source(paths):
+    """Open one or more QA-source chunks; concat along time if multiple.
+
+    Assumes all chunks share the same row_offset/col_offset crop (true for
+    a single chunk-gen run).
+    """
+    dsets = []
+    for p in paths:
+        d = xr.open_zarr(p) if str(p).endswith(".zarr") else \
+            xr.open_dataset(p, engine="h5netcdf")
+        dsets.append(d)
+    qa = xr.concat(dsets, dim="time") if len(dsets) > 1 else dsets[0]
+    ro = _scalar_int(dsets[0].attrs.get("row_offset"), 0)
+    co = _scalar_int(dsets[0].attrs.get("col_offset"), 0)
+    return qa, ro, co
+
+
+def evaluate_store(stereo_path, df, label, qa_from=None):
+    """Evaluate a stereo store (zarr or netcdf) against the parquet.
+
+    qa_from : optional list of paths to a teacher chunk store whose
+        chi²/sigma_h/qf will define the QA mask, instead of the stereo
+        store's own fields. Use this to evaluate a student cache that
+        doesn't emit its own chi² — the mask is built from the teacher's
+        solver at the matched time and padded to the student's grid.
+    """
     if str(stereo_path).endswith(".zarr"):
         ds = xr.open_zarr(stereo_path)
     else:
@@ -185,8 +251,23 @@ def evaluate_store(stereo_path, df, label):
     if "time" not in ds.dims:
         ds = ds.expand_dims("time")
 
+    # Cropped chunks store row_offset/col_offset attrs giving the upper-left
+    # full-disk index of the crop. The parquet's row_19/col_19 are full-disk
+    # coordinates, so we need to subtract these to index the local grid.
+    # Full-disk inference outputs default to 0.
+    row_offset = _scalar_int(ds.attrs.get("row_offset"), 0)
+    col_offset = _scalar_int(ds.attrs.get("col_offset"), 0)
+
+    qa_ds, qa_ro, qa_co = (None, 0, 0)
+    if qa_from:
+        qa_ds, qa_ro, qa_co = _open_qa_source(qa_from)
+        logger.info("QA source: %d times, crop=(row_offset=%d, col_offset=%d)",
+                    qa_ds.sizes["time"], qa_ro, qa_co)
+
     times = ds.time.values
-    logger.info("Evaluating %s: %d times", label, len(times))
+    logger.info("Evaluating %s: %d times (row_offset=%d, col_offset=%d)%s",
+                label, len(times), row_offset, col_offset,
+                " [QA from external]" if qa_ds is not None else "")
 
     df["goes_time"] = pd.to_datetime(df["goes_time"]).values.astype("datetime64[ns]")
     parquet_times = df["goes_time"].values
@@ -207,7 +288,36 @@ def evaluate_store(stereo_path, df, label):
         df_time = nearby[nearby["goes_time"] == nearest_t]
         slice_ = ds.isel(time=ti)
         slice_.load()
-        matches = evaluate_one_time(slice_, ti, df_time)
+
+        external_mask = None
+        if qa_ds is not None:
+            # Match by nearest time in qa_ds (chunks usually share the same
+            # 10-min cadence as the inference output).
+            qa_times = qa_ds.time.values
+            j = int(np.argmin(np.abs(qa_times.astype("datetime64[ns]") - t_ns)))
+            # Tolerate small jitter; warn if the gap is > 30 min.
+            dt = abs(int((qa_times[j] - t_ns).astype("timedelta64[s]")
+                         .astype(np.int64)))
+            if dt > 1800:
+                logger.warning("  qa source nearest time off by %ds at %s",
+                               dt, str(t)[:16])
+            qa_slice = qa_ds.isel(time=j).load()
+            local_mask = _build_qa_mask(qa_slice)
+            stu_shape = slice_["cloud_top_height"].shape
+            if local_mask.shape == stu_shape:
+                external_mask = local_mask
+            else:
+                # qa source is cropped relative to stereo (full-disk student).
+                # Pad with False outside the qa crop. Account for the stereo
+                # store's own crop offset (rare; usually 0 for inference).
+                external_mask = _pad_mask_to_shape(
+                    local_mask, stu_shape,
+                    qa_ro - row_offset, qa_co - col_offset)
+
+        matches = evaluate_one_time(slice_, ti, df_time,
+                                    row_offset=row_offset,
+                                    col_offset=col_offset,
+                                    qa_mask=external_mask)
         all_matches.extend(matches)
     return all_matches
 
@@ -321,6 +431,13 @@ def main():
     parser.add_argument("--split", choices=["all", "train", "val"], default="all",
                         help="Station split to evaluate. 'val' = held-out stations "
                              "(station_idx %% 5 == 0), matching IGRADataset's split.")
+    parser.add_argument("--qa-from", nargs="+", default=None,
+                        help="Teacher chunk path(s) whose chi²/sigma_h/qf "
+                             "define the QA mask, padded to the stereo grid. "
+                             "Use this when --stereo is a student cache that "
+                             "doesn't emit its own chi² (writes zeros). The "
+                             "student inherits the teacher's QA gate so its "
+                             "RMSVD is comparable to the teacher's IGRA score.")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO,
@@ -343,7 +460,8 @@ def main():
         # Aggregate matches across all --stereo stores into one summary.
         all_matches = []
         for stereo_path in args.stereo:
-            all_matches.extend(evaluate_store(stereo_path, df, args.label))
+            all_matches.extend(evaluate_store(stereo_path, df, args.label,
+                                              qa_from=args.qa_from))
         logger.info("Aggregated %d stores → %d total matches",
                     len(args.stereo), len(all_matches))
         df_m = summarize(all_matches, args.label)
@@ -352,7 +470,8 @@ def main():
     else:
         for stereo_path in args.stereo:
             label = Path(stereo_path).stem
-            matches = evaluate_store(stereo_path, df, label)
+            matches = evaluate_store(stereo_path, df, label,
+                                     qa_from=args.qa_from)
             df_m = summarize(matches, label)
             if args.plot_dir and df_m is not None and len(df_m) > 0:
                 plot_eval(df_m, label, args.plot_dir)
