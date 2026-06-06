@@ -86,6 +86,7 @@ class StudentXBatchDataset(Dataset):
         preload: bool = True,
         seed: int | None = None,
         rad_time_frames: int = 1,
+        random_crop: bool = True,
     ):
         super().__init__()
         if rad_time_frames not in (1, 3):
@@ -100,6 +101,12 @@ class StudentXBatchDataset(Dataset):
         self.qa_high = qa_high
         self.high_weight = high_weight
         self.min_label_frac = min_label_frac
+        # Random spatial cropping is train-only — keeping val tiles
+        # deterministic makes eval/rmsvd a stable signal for EarlyStopping
+        # and the best-val checkpoint. Flips/rotations are NOT applied:
+        # u,v are world-frame vectors and naive symmetry breaks them.
+        self.random_crop = bool(random_crop) and train
+        self.train = train
         self.rng = np.random.default_rng(seed)
 
         # chunks=None returns numpy-lazy arrays (direct zarr reads, no dask) —
@@ -160,8 +167,16 @@ class StudentXBatchDataset(Dataset):
             input_overlap={"y": step, "x": step},
             preload_batch=False,
         )
-        logger.info("StudentXBatchDataset: %d %s times, %d tiles",
-                    len(times), "train" if train else "val", len(self.bgen))
+        # Bounds for random_crop: spatial origin in [0, fh-ps] × [0, fw-ps].
+        # The bgen length controls __len__ either way (so per-epoch step count
+        # stays comparable to the deterministic-tiling baseline).
+        self._n_times = len(times)
+        self._fh = int(ds.sizes["y"])
+        self._fw = int(ds.sizes["x"])
+        logger.info(
+            "StudentXBatchDataset: %d %s times, %d tiles%s",
+            len(times), "train" if train else "val", len(self.bgen),
+            " (random_crop)" if self.random_crop else "")
 
     @staticmethod
     def _in_split(t, train: bool, val_mod: int) -> bool:
@@ -191,7 +206,29 @@ class StudentXBatchDataset(Dataset):
         raise RuntimeError("No labeled tile after 50 attempts")
 
     def _load(self, idx):
-        x = self.bgen[idx].squeeze("time", drop=True)  # dims (y, x[, ...])
+        # Train: random-crop a patch_size² tile at a random spatial origin
+        # within the chunk's overlap window, round-robin over times to keep
+        # temporal coverage roughly uniform across the epoch.
+        # Val: deterministic bgen tiling so eval/rmsvd is comparable
+        # epoch-to-epoch (EarlyStopping + best-val depend on this).
+        # Flips/rotations are NOT applied — would break the world-frame u,v.
+        if self.random_crop:
+            t_idx = idx % self._n_times
+            max_y = self._fh - self.patch_size
+            max_x = self._fw - self.patch_size
+            if max_y < 0 or max_x < 0:
+                raise ValueError(
+                    f"patch_size={self.patch_size} larger than chunk "
+                    f"extent ({self._fh}, {self._fw}); cannot crop")
+            y0 = int(self.rng.integers(0, max_y + 1)) if max_y > 0 else 0
+            x0 = int(self.rng.integers(0, max_x + 1)) if max_x > 0 else 0
+            x = self.ds.isel(
+                time=t_idx,
+                y=slice(y0, y0 + self.patch_size),
+                x=slice(x0, x0 + self.patch_size),
+            )
+        else:
+            x = self.bgen[idx].squeeze("time", drop=True)  # dims (y, x[, ...])
 
         def arr(name):
             return x[name].values.astype(np.float32)
