@@ -60,6 +60,9 @@ class StudentWindsModel(BaseLightningModule):
         rad_time_frames: int = 1,
         learning_rate: float = 3e-4,
         log_media_step: int = 200,
+        predict_chi2: bool = False,
+        w_chi2: float = 0.1,
+        w_speed: float = 0.0,
         **kwargs,
     ):
         # Radiance is standardized per band×frame by the zeus StandardScalar
@@ -88,6 +91,18 @@ class StudentWindsModel(BaseLightningModule):
             raise ValueError(f"wind_loss must be 'gaussian' or 'vector', got {wind_loss!r}")
         self.wind_loss = wind_loss
         self.logvar_init_offset = logvar_init_offset
+        # Optional teacher-chi² distillation: an extra head channel predicts
+        # log(teacher_chi²). At inference time the student emits its own
+        # chi² (instead of zeros), enabling downstream QA filtering without
+        # the teacher zarr.  Loss is L1 on log(chi²) — robust to the heavy
+        # right tail of solver residuals.
+        self.predict_chi2 = bool(predict_chi2)
+        self.w_chi2 = float(w_chi2)
+        # Optional speed-magnitude loss: addresses the systematic ~-3 m/s
+        # under-prediction of wind speed in vector-NLL training (where the
+        # data term is componentwise on u,v and smoothing biases magnitude
+        # toward zero).  Weighted MSE between |V_pred| and |V_teacher|.
+        self.w_speed = float(w_speed)
 
         in_channels = 4 * n_flow_bands + n_rad_channels + 3
         self.rad_time_frames = rad_time_frames
@@ -96,6 +111,7 @@ class StudentWindsModel(BaseLightningModule):
             self.net = PixelwiseWindStudent(
                 in_channels=in_channels, hidden=hidden, n_layers=n_layers,
                 context=context, wind_logvar_mode=wlm,
+                predict_chi2=self.predict_chi2,
             )
         elif trunk == "unet":
             self.net = UNetWindStudent(
@@ -103,6 +119,7 @@ class StudentWindsModel(BaseLightningModule):
                 base_channels=unet_base_channels,
                 n_levels=unet_n_levels,
                 wind_logvar_mode=wlm,
+                predict_chi2=self.predict_chi2,
             )
         else:
             raise ValueError(f"trunk must be 'pixelwise' or 'unet', got {trunk!r}")
@@ -161,6 +178,10 @@ class StudentWindsModel(BaseLightningModule):
         else:
             out["u_logvar"] = delta["u_logvar"]
             out["v_logvar"] = delta["v_logvar"]
+        # Pass the chi² head through unchanged — it's a teacher distillation,
+        # not a residual-on-baseline, so no physics-prior offset applies.
+        if self.predict_chi2 and "log_chi2" in delta:
+            out["log_chi2"] = delta["log_chi2"]
         return out
 
     @torch.no_grad()
@@ -218,6 +239,11 @@ class StudentWindsModel(BaseLightningModule):
         else:
             result["u_logvar"] = out["u_logvar"] + 2 * log_sd[0]
             result["v_logvar"] = out["v_logvar"] + 2 * log_sd[1]
+        if self.predict_chi2 and "log_chi2" in out:
+            # Exponentiate to the physical chi² for downstream QA gating.
+            # Clamp the exponent to keep extreme outputs finite when downstream
+            # code does straight comparisons.
+            result["chi2"] = torch.exp(out["log_chi2"].clamp(-20.0, 20.0))
         return result
 
     def step(self, batch, batch_idx):
@@ -259,6 +285,32 @@ class StudentWindsModel(BaseLightningModule):
             self.log(f"{m}/nll_u", nll_u, batch_size=bs)
             self.log(f"{m}/nll_v", nll_v, batch_size=bs)
             self.log(f"{m}/nll_h", nll_h, batch_size=bs)
+            # Physical-units predictions needed for speed term in both modes.
+            u_p = out["u_mean"] * sd[0] + mu[0]
+            v_p = out["v_mean"] * sd[1] + mu[1]
+
+        # Optional speed-magnitude term: counteract the smoothing-induced
+        # under-prediction of |V|.  Weighted MSE on masked pixels.
+        if self.w_speed > 0 and mask.any():
+            eps = 1e-6
+            spd_p = torch.sqrt(u_p.pow(2) + v_p.pow(2) + eps)
+            spd_t = torch.sqrt(batch["u"].pow(2) + batch["v"].pow(2) + eps)
+            sq = (spd_p - spd_t).pow(2)
+            w_sum = (w * mask.float()).sum().clamp_min(1.0)
+            speed_mse = (sq * w * mask.float()).sum() / w_sum
+            loss = loss + self.w_speed * speed_mse
+            self.log(f"{m}/speed_mse", speed_mse, batch_size=bs)
+
+        # Optional chi² distillation: L1 on log(teacher_chi²).  log makes the
+        # right-tailed solver residual better-conditioned for regression.
+        if self.predict_chi2 and "chi2" in batch and mask.any():
+            chi2_t = batch["chi2"].clamp_min(1e-6)
+            log_chi2_t = torch.log(chi2_t)
+            chi2_resid = (out["log_chi2"] - log_chi2_t).abs()
+            w_sum = (w * mask.float()).sum().clamp_min(1.0)
+            chi2_l1 = (chi2_resid * w * mask.float()).sum() / w_sum
+            loss = loss + self.w_chi2 * chi2_l1
+            self.log(f"{m}/chi2_l1", chi2_l1, batch_size=bs)
 
         with torch.no_grad():
             if mask.any():

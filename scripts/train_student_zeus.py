@@ -111,6 +111,22 @@ def main():
                         "Train-only — val keeps deterministic xbatcher tiling "
                         "so eval/rmsvd is a stable signal. Flips/rotations are "
                         "intentionally NOT applied (world-frame u,v).")
+    p.add_argument("--predict-chi2", dest="predict_chi2",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Distill the teacher's chi² as an extra head channel "
+                        "(log-space L1 loss). The student then emits its own "
+                        "chi² at inference, enabling downstream QA filtering "
+                        "without --qa-from teacher.")
+    p.add_argument("--w-chi2", type=float, default=0.1,
+                   help="Weight on the chi²-distillation L1 loss term "
+                        "(only used when --predict-chi2). Default 0.1 keeps "
+                        "it modest vs the wind/h NLL budget.")
+    p.add_argument("--w-speed", type=float, default=0.0,
+                   help="Weight on the speed-magnitude MSE penalty "
+                        "((|V_pred| - |V_teacher|)²). 0 disables. Use to "
+                        "counteract the systematic ~-3 m/s under-prediction "
+                        "of wind speed observed with vector NLL alone "
+                        "(componentwise smoothing biases magnitude → 0).")
     p.add_argument("--early-stop-patience", type=int, default=5,
                    help="Stop training if eval/rmsvd doesn't improve for N "
                         "consecutive evals (only active when --val-months is "
@@ -175,6 +191,9 @@ def main():
         trunk=args.trunk, unet_base_channels=args.unet_base_channels,
         unet_n_levels=args.unet_n_levels,
         rad_time_frames=args.rad_time_frames,
+        predict_chi2=args.predict_chi2,
+        w_chi2=args.w_chi2,
+        w_speed=args.w_speed,
         learning_rate=args.lr,
     )
 

@@ -154,7 +154,10 @@ def _forward_full_disk(
 ) -> dict[str, np.ndarray]:
     """Forward in row-strips; returns (H, W) arrays in physical units."""
     H, W = flow_arr.shape[1], flow_arr.shape[2]
-    keys = ("u_mean", "v_mean", "h_mean", "u_logvar", "v_logvar", "h_logvar")
+    keys = ["u_mean", "v_mean", "h_mean", "u_logvar", "v_logvar", "h_logvar"]
+    # If the trained model has a chi² head, surface it too.
+    if getattr(model, "predict_chi2", False):
+        keys.append("chi2")
     out = {k: np.full((H, W), np.nan, np.float32) for k in keys}
     with torch.no_grad():
         for r in range(0, H, row_strip):
@@ -207,14 +210,20 @@ def infer_one_time(
 
     valid = finite_mask & np.isfinite(u) & np.isfinite(v) & np.isfinite(h_km)
     qf = np.where(valid, 2.0, 0.0).astype(np.float32)
+    # chi²: distilled head if available, else zeros (legacy student).
+    if "chi2" in raw:
+        chi2 = np.where(finite_mask, raw["chi2"], np.nan).astype(np.float32)
+    else:
+        chi2 = np.zeros_like(u, dtype=np.float32)
     return {
         "u_wind": u.astype(np.float32),
         "v_wind": v.astype(np.float32),
         "cloud_top_height": (h_km * 1000.0).astype(np.float32),  # m
         "quality_flag": qf,
-        # No WLS residual for a regression student — emit zeros so the
-        # stereo-cache eval pipeline can read this store as a drop-in.
-        "chi_squared": np.zeros_like(u, dtype=np.float32),
+        # Distilled teacher chi² (or zeros if the trained head wasn't enabled)
+        # so the stereo-cache eval pipeline can apply the strict QA gate
+        # without --qa-from teacher.
+        "chi_squared": chi2,
         "sigma_u": sigma_u.astype(np.float32),
         "sigma_v": sigma_v.astype(np.float32),
         "sigma_h": (sigma_h_km * 1000.0).astype(np.float32),     # m
