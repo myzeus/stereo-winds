@@ -36,7 +36,11 @@ from .student_dataset import (
 logger = logging.getLogger(__name__)
 
 PATCH_SIZE = 256
+# chi_squared is OPTIONAL — older chunks won't have it. The dataset assigns it
+# from the label store only if present; consumers (e.g. chi²-distill training)
+# check the returned key.
 _LABEL_VARS = ["u_wind", "v_wind", "cloud_top_height", "quality_flag"]
+_OPTIONAL_LABEL_VARS = ["chi_squared"]
 
 
 class StudentXBatchDataset(Dataset):
@@ -152,6 +156,15 @@ class StudentXBatchDataset(Dataset):
         for v in _LABEL_VARS:
             if v not in ds:
                 ds = ds.assign({v: (("time", "y", "x"), lab[v].data)})
+        # chi_squared is OPTIONAL — graft only if the label store actually
+        # has it.  Lets older chunks still load.
+        self.has_chi2 = False
+        for v in _OPTIONAL_LABEL_VARS:
+            if v not in ds and v in lab:
+                ds = ds.assign({v: (("time", "y", "x"), lab[v].data)})
+                self.has_chi2 = self.has_chi2 or (v == "chi_squared")
+            elif v in ds:
+                self.has_chi2 = self.has_chi2 or (v == "chi_squared")
         # Load the overlap crop into RAM (numpy) so xbatcher tiles are pure
         # slicing — fast and fork-safe (dask-backed reads deadlock under forked
         # DataLoader workers). Fine at this scale; stream (preload=False) for
@@ -258,7 +271,7 @@ class StudentXBatchDataset(Dataset):
                          arr("sat_zenith") / ZENITH_NORM], 0)
 
         nan = lambda a: np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-        return {
+        sample = {
             "flow": torch.from_numpy(nan(flow)),
             "rad": torch.from_numpy(nan(rad)),
             "geom": torch.from_numpy(nan(geom)),
@@ -268,3 +281,10 @@ class StudentXBatchDataset(Dataset):
             "mask": torch.from_numpy(mask),
             "weight": torch.from_numpy(weight),
         }
+        if self.has_chi2:
+            # Clamp lower (chi² is non-negative) and upper (a few outliers
+            # have chi² > 1e6 that would blow up log).  Loss applies log()
+            # downstream, so clamp keeps gradients finite.
+            chi2 = np.clip(arr("chi_squared"), 1e-6, 1e4)
+            sample["chi2"] = torch.from_numpy(nan(chi2))
+        return sample

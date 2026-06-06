@@ -32,21 +32,36 @@ def _hetero_head_outputs(
     wind_logvar_mode: str,
     logvar_min: float,
     logvar_max: float,
+    predict_chi2: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Slice raw (B, n_out, H, W) into the heteroscedastic head dict.
 
     Same key contract as ``PixelwiseWindStudent.forward`` so the LightningModule
     doesn't care which trunk produced ``raw``.
+
+    When ``predict_chi2``, the last channel is the student's prediction of
+    log(teacher_chi²) — distilling the WLS-solver residual so the student can
+    emit its own QA-gate at inference (no need for ``eval_from_parquet --qa-from``).
     """
     out = {"u_mean": raw[:, 0], "v_mean": raw[:, 1], "h_mean": raw[:, 2]}
     if wind_logvar_mode == "per_component":
         out["u_logvar"] = raw[:, 3].clamp(logvar_min, logvar_max)
         out["v_logvar"] = raw[:, 4].clamp(logvar_min, logvar_max)
         out["h_logvar"] = raw[:, 5].clamp(logvar_min, logvar_max)
+        next_idx = 6
     else:  # joint
         out["uv_logvar"] = raw[:, 3].clamp(logvar_min, logvar_max)
         out["h_logvar"] = raw[:, 4].clamp(logvar_min, logvar_max)
+        next_idx = 5
+    if predict_chi2:
+        out["log_chi2"] = raw[:, next_idx]
     return out
+
+
+def head_n_out(wind_logvar_mode: str, predict_chi2: bool = False) -> int:
+    """Total channels in the heteroscedastic head."""
+    base = 6 if wind_logvar_mode == "per_component" else 5
+    return base + (1 if predict_chi2 else 0)
 
 
 class PixelwiseWindStudent(nn.Module):
@@ -81,6 +96,7 @@ class PixelwiseWindStudent(nn.Module):
         logvar_min: float = -10.0,
         logvar_max: float = 10.0,
         wind_logvar_mode: str = "per_component",
+        predict_chi2: bool = False,
     ):
         super().__init__()
         if n_layers < 1:
@@ -93,6 +109,7 @@ class PixelwiseWindStudent(nn.Module):
         self.logvar_min = logvar_min
         self.logvar_max = logvar_max
         self.wind_logvar_mode = wind_logvar_mode
+        self.predict_chi2 = predict_chi2
 
         layers: list[nn.Module] = []
         if context:
@@ -113,7 +130,8 @@ class PixelwiseWindStudent(nn.Module):
 
         # per_component: 6 outputs (u_mean, v_mean, h_mean, u_logvar, v_logvar, h_logvar)
         # joint:         5 outputs (u_mean, v_mean, h_mean, uv_logvar, h_logvar)
-        self.n_out = 6 if wind_logvar_mode == "per_component" else 5
+        # + 1 extra log_chi2 channel when predict_chi2.
+        self.n_out = head_n_out(wind_logvar_mode, predict_chi2)
         self.head = nn.Conv2d(hidden, self.n_out, 1)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -137,6 +155,7 @@ class PixelwiseWindStudent(nn.Module):
         raw = self.head(self.trunk(x))
         return _hetero_head_outputs(
             raw, self.wind_logvar_mode, self.logvar_min, self.logvar_max,
+            predict_chi2=self.predict_chi2,
         )
 
 
@@ -190,6 +209,7 @@ class UNetWindStudent(nn.Module):
         logvar_min: float = -10.0,
         logvar_max: float = 10.0,
         wind_logvar_mode: str = "per_component",
+        predict_chi2: bool = False,
     ):
         super().__init__()
         if wind_logvar_mode not in ("per_component", "joint"):
@@ -203,6 +223,7 @@ class UNetWindStudent(nn.Module):
         self.logvar_min = logvar_min
         self.logvar_max = logvar_max
         self.wind_logvar_mode = wind_logvar_mode
+        self.predict_chi2 = predict_chi2
         self.n_levels = n_levels
 
         # Channel widths per level: [base, 2*base, 4*base, ...]
@@ -224,8 +245,8 @@ class UNetWindStudent(nn.Module):
             skip_ch = widths[i]
             self.decoders.append(_double_conv(up_ch + skip_ch, skip_ch))
 
-        # per_component: 6 outputs; joint: 5 outputs
-        self.n_out = 6 if wind_logvar_mode == "per_component" else 5
+        # per_component: 6 outputs; joint: 5 outputs (+1 for chi²).
+        self.n_out = head_n_out(wind_logvar_mode, predict_chi2)
         self.head = nn.Conv2d(widths[0], self.n_out, 1)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -246,4 +267,5 @@ class UNetWindStudent(nn.Module):
         raw = self.head(h)
         return _hetero_head_outputs(
             raw, self.wind_logvar_mode, self.logvar_min, self.logvar_max,
+            predict_chi2=self.predict_chi2,
         )

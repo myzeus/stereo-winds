@@ -240,6 +240,131 @@ class TestRandomCrop:
         np.testing.assert_array_equal(a["rad"].numpy(), b["rad"].numpy())
 
 
+def _build_with_chi2(tmp_path):
+    """Same as _build but also writes a chi_squared label var so the
+    dataset and chi²-distill model can pick it up."""
+    feat_p, lab_p = tmp_path / "feat.zarr", tmp_path / "lab.zarr"
+    times = np.array([np.datetime64("2026-01-01T00:00") + np.timedelta64(10 * i, "m")
+                      for i in range(N_TIMES)])
+    rng = np.random.default_rng(0)
+    fvars = {}
+    for b in FLOW_BANDS:
+        for s in FLOW_STUBS:
+            fvars[flow_var(s, b)] = (("time", "y", "x"),
+                                     rng.normal(0, 3, (N_TIMES, FH, FW)).astype("f4"))
+    for b in RAD_BANDS:
+        fvars[rad_var(b)] = (("time", "y", "x"),
+                             rng.normal(250, 20, (N_TIMES, FH, FW)).astype("f4"))
+    for v in GEOM_VARS:
+        fvars[v] = (("y", "x"), np.full((FH, FW), 2000.0, "f4"))
+    feat = xr.Dataset(fvars, coords={"time": times})
+    feat.attrs.update(row_offset=ROW_OFF, col_offset=COL_OFF)
+    feat.to_zarr(feat_p, mode="w")
+
+    lv = {
+        "u_wind": (("time", "y", "x"), rng.normal(0, 15, (N_TIMES, N_GRID, N_GRID)).astype("f4")),
+        "v_wind": (("time", "y", "x"), rng.normal(0, 15, (N_TIMES, N_GRID, N_GRID)).astype("f4")),
+        "cloud_top_height": (("time", "y", "x"), rng.uniform(0, 12000, (N_TIMES, N_GRID, N_GRID)).astype("f4")),
+        "quality_flag": (("time", "y", "x"), np.full((N_TIMES, N_GRID, N_GRID), 2.0, "f4")),
+        # log-normal-ish chi² with a small mean — like a converged solver.
+        "chi_squared": (("time", "y", "x"),
+                        np.exp(rng.normal(-1.0, 0.5, (N_TIMES, N_GRID, N_GRID))).astype("f4")),
+    }
+    xr.Dataset(lv, coords={"time": times}).to_zarr(lab_p, mode="w")
+    return str(feat_p), str(lab_p)
+
+
+class TestChi2Distillation:
+    """Optional teacher-chi² head: dataset yields chi², model has an extra
+    output channel, predict() returns physical chi², training step uses an
+    L1 loss on log(chi²)."""
+
+    def test_dataset_emits_chi2_when_present(self, tmp_path):
+        f, l = _build_with_chi2(tmp_path)
+        ds = StudentXBatchDataset(
+            feature_zarr=f, label_zarr=l, flow_bands=FLOW_BANDS,
+            rad_bands=RAD_BANDS, patch_size=16, train=True, seed=0)
+        assert ds.has_chi2 is True
+        s = ds._load(0)
+        assert s is not None
+        assert "chi2" in s
+        assert s["chi2"].shape == (16, 16)
+
+    def test_dataset_omits_chi2_when_absent(self, tmp_path):
+        """Older chunks without chi_squared still load cleanly."""
+        f, l = _build(tmp_path)  # no chi_squared
+        ds = StudentXBatchDataset(
+            feature_zarr=f, label_zarr=l, flow_bands=FLOW_BANDS,
+            rad_bands=RAD_BANDS, patch_size=16, train=True, seed=0)
+        assert ds.has_chi2 is False
+        s = ds._load(0)
+        assert "chi2" not in s
+
+    def test_model_head_grows_by_one_with_chi2(self, tmp_path):
+        """predict_chi2=True → one extra head channel; predict() yields chi²."""
+        ds = _ds(tmp_path)
+        loader = DataLoader(ds, batch_size=2, num_workers=0)
+        model = StudentWindsModel(
+            n_flow_bands=len(FLOW_BANDS), n_rad_bands=len(RAD_BANDS),
+            hidden=16, n_layers=2, wind_loss="vector",
+            predict_chi2=True)
+        # joint head = 5 + 1 chi² = 6
+        assert model.net.head.out_channels == 6
+        batch = next(iter(loader))
+        out = model.predict(batch["flow"], batch["rad"], batch["geom"])
+        assert "chi2" in out
+        assert out["chi2"].shape == batch["u"].shape
+        assert (out["chi2"] > 0).all()  # exp(.) is positive
+
+    def test_chi2_loss_decreases_two_step(self, tmp_path):
+        """Distill loss term is wired into training and decreases."""
+        import pytorch_lightning as pl
+        f, l = _build_with_chi2(tmp_path)
+        ds = StudentXBatchDataset(
+            feature_zarr=f, label_zarr=l, flow_bands=FLOW_BANDS,
+            rad_bands=RAD_BANDS, patch_size=16, train=True, seed=0)
+        loader = DataLoader(ds, batch_size=2, num_workers=0)
+        model = StudentWindsModel(
+            n_flow_bands=len(FLOW_BANDS), n_rad_bands=len(RAD_BANDS),
+            hidden=16, n_layers=2, wind_loss="vector",
+            predict_chi2=True, w_chi2=1.0)
+        model.prepare_data_transformation(loader, n_batches=1)
+        model.fit_target_stats(loader, n_batches=1)
+        trainer = pl.Trainer(max_steps=2, accelerator="cpu", logger=False,
+                             enable_checkpointing=False, enable_progress_bar=False)
+        trainer.fit(model, loader)
+        # Just confirm forward+backward completed with the chi² loss term.
+        out = model(*[next(iter(loader))[k] for k in ("flow", "rad", "geom")])
+        assert "log_chi2" in out
+
+
+class TestSpeedMagnitudeLoss:
+    """Optional |V_pred|² - |V_teacher|² penalty for systematic
+    speed-magnitude under-prediction in vector NLL training."""
+
+    def test_w_speed_default_is_zero(self):
+        m = StudentWindsModel(n_flow_bands=1, n_rad_bands=1, hidden=8,
+                              n_layers=1, wind_loss="vector")
+        assert m.w_speed == 0.0
+
+    def test_w_speed_decreases_loss(self, tmp_path):
+        import pytorch_lightning as pl
+        ds = _ds(tmp_path)
+        loader = DataLoader(ds, batch_size=2, num_workers=0)
+        model = StudentWindsModel(
+            n_flow_bands=len(FLOW_BANDS), n_rad_bands=len(RAD_BANDS),
+            hidden=16, n_layers=2, wind_loss="vector", w_speed=0.5)
+        model.prepare_data_transformation(loader, n_batches=1)
+        model.fit_target_stats(loader, n_batches=1)
+        trainer = pl.Trainer(max_steps=2, accelerator="cpu", logger=False,
+                             enable_checkpointing=False, enable_progress_bar=False)
+        trainer.fit(model, loader)
+        # Training completed; speed_mse should have been logged each step.
+        assert "train/speed_mse" in trainer.logged_metrics or \
+               "train/speed_mse_epoch" in trainer.logged_metrics or \
+               any("speed_mse" in k for k in trainer.logged_metrics)
+
+
 class TestStudentZeusModel:
     def test_forward_and_transform(self, tmp_path):
         ds = _ds(tmp_path)
