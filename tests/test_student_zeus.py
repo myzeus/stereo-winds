@@ -183,6 +183,63 @@ class TestMonthSplit:
         assert len(tr) > 0 and len(va) > 0
 
 
+class TestRandomCrop:
+    """Train-only random spatial cropping helps U-Net generalization without
+    breaking the world-frame u,v vectors (no flips/rotations)."""
+
+    def test_train_random_crop_varies_tile_origin(self, tmp_path):
+        """Same idx, two calls → different spatial tiles (random crop active)."""
+        f, l = _build(tmp_path)
+        ds = StudentXBatchDataset(
+            feature_zarr=f, label_zarr=l, flow_bands=FLOW_BANDS,
+            rad_bands=RAD_BANDS, patch_size=16, train=True,
+            random_crop=True, seed=0)
+        assert ds.random_crop is True
+        # Many calls to one idx should cover multiple distinct origins.
+        rads = set()
+        for _ in range(20):
+            s = ds._load(0)
+            assert s is not None
+            assert s["rad"].shape == (len(RAD_BANDS), 16, 16)
+            # Hash the (4,4) top-left corner of channel 0 as a tile fingerprint.
+            rads.add(s["rad"][0, :4, :4].numpy().tobytes())
+        assert len(rads) > 1, "random_crop returned identical tiles for same idx"
+
+    def test_val_is_deterministic_even_with_random_crop_flag(self, tmp_path):
+        """random_crop=True on val (train=False) is silently disabled."""
+        f, l = _build(tmp_path)
+        va = StudentXBatchDataset(
+            feature_zarr=f, label_zarr=l, flow_bands=FLOW_BANDS,
+            rad_bands=RAD_BANDS, patch_size=16, train=False,
+            random_crop=True, seed=0)
+        # Constructor turns it off for val.
+        assert va.random_crop is False
+        # Two reads of the same idx must be byte-identical (no rng draws).
+        a = va._load(0); b = va._load(0)
+        assert a is not None and b is not None
+        np.testing.assert_array_equal(a["rad"].numpy(), b["rad"].numpy())
+
+    def test_default_random_crop_is_on(self, tmp_path):
+        """Default is opt-in; train datasets should random-crop by default."""
+        f, l = _build(tmp_path)
+        tr = StudentXBatchDataset(
+            feature_zarr=f, label_zarr=l, flow_bands=FLOW_BANDS,
+            rad_bands=RAD_BANDS, patch_size=16, train=True, seed=0)
+        assert tr.random_crop is True
+
+    def test_random_crop_off_matches_legacy_bgen(self, tmp_path):
+        """random_crop=False on train falls back to xbatcher's grid."""
+        f, l = _build(tmp_path)
+        tr = StudentXBatchDataset(
+            feature_zarr=f, label_zarr=l, flow_bands=FLOW_BANDS,
+            rad_bands=RAD_BANDS, patch_size=16, train=True,
+            random_crop=False, seed=0)
+        assert tr.random_crop is False
+        a = tr._load(0); b = tr._load(0)
+        # Deterministic xbatcher → same tile twice.
+        np.testing.assert_array_equal(a["rad"].numpy(), b["rad"].numpy())
+
+
 class TestStudentZeusModel:
     def test_forward_and_transform(self, tmp_path):
         ds = _ds(tmp_path)

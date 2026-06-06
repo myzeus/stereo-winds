@@ -104,6 +104,13 @@ def main():
                         "val_mod=5 intra-month decimation, which lets the model "
                         "overfit to the training months.  Required for any run "
                         "claiming generalization.")
+    p.add_argument("--random-crop", dest="random_crop",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Random spatial crop per train sample within each "
+                        "chunk's overlap window (round-robin over times). "
+                        "Train-only — val keeps deterministic xbatcher tiling "
+                        "so eval/rmsvd is a stable signal. Flips/rotations are "
+                        "intentionally NOT applied (world-frame u,v).")
     p.add_argument("--early-stop-patience", type=int, default=5,
                    help="Stop training if eval/rmsvd doesn't improve for N "
                         "consecutive evals (only active when --val-months is "
@@ -130,6 +137,7 @@ def main():
         preload=not args.no_preload, seed=42,
         rad_time_frames=args.rad_time_frames,
         val_months=val_months_list,
+        random_crop=args.random_crop,
     )
 
     def _build(train):
