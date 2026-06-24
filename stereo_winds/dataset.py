@@ -502,20 +502,36 @@ class IGRADataset(Dataset):
             sat_a_zarr = [sat_a_zarr]
             sat_b_zarr = [sat_b_zarr]
         self._band_pairs = []
+        good_a, good_b = [], []  # paths of successfully opened pairs
         for a, b in zip(sat_a_zarr, sat_b_zarr):
-            ds_a = xr.open_dataset(str(a), engine="zarr", chunks={})
-            ds_b = xr.open_dataset(str(b), engine="zarr", chunks={})
+            try:
+                ds_a = xr.open_dataset(str(a), engine="zarr", chunks={})
+                ds_b = xr.open_dataset(str(b), engine="zarr", chunks={})
+            except Exception as e:
+                # A single corrupt/partial band store (e.g. a zarr missing its
+                # root group) must not drop the whole month — skip just that band.
+                logger.warning(
+                    "IGRADataset: skipping unreadable band store %s / %s (%s: %s)",
+                    Path(str(a)).name, Path(str(b)).name, type(e).__name__, e,
+                )
+                continue
             self._band_pairs.append((ds_a, ds_b))
+            good_a.append(str(a))
+            good_b.append(str(b))
+        if not self._band_pairs:
+            raise FileNotFoundError(
+                f"IGRADataset: no readable band stores among {len(sat_a_zarr)} pair(s)"
+            )
         logger.info("IGRADataset: %d band pair(s)", len(self._band_pairs))
 
         # For backward compat (single pair access)
         self.ds_a = self._band_pairs[0][0]
         self.ds_b = self._band_pairs[0][1]
 
-        # Valid times: based on the first (primary) band pair.
+        # Valid times: based on the first (readable) band pair.
         # Other bands are tried randomly at __getitem__ time with fallback.
         valid_times_set = set(build_triplet_index(
-            [sat_a_zarr[0]], [sat_b_zarr[0]], dt_minutes,
+            [good_a[0]], [good_b[0]], dt_minutes,
         ))
 
         par = np.load(parallax_path)
@@ -607,14 +623,20 @@ class IGRADataset(Dataset):
         return len(self._samples)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        try:
-            return self._getitem_inner(idx)
-        except RuntimeError as e:
-            if "decompression" in str(e).lower():
-                logger.warning("Corrupt chunk at idx %d, sampling replacement", idx)
-                alt = self.rng.integers(len(self._samples))
-                return self._getitem_inner(alt)
-            raise
+        # Retry on corrupt-chunk (zstd) decompression errors by resampling a
+        # different index. A single retry is not enough: with prefetching the
+        # replacement can also land on a bad chunk, so loop several times.
+        for attempt in range(16):
+            try:
+                return self._getitem_inner(idx)
+            except RuntimeError as e:
+                if "decompression" not in str(e).lower():
+                    raise
+                logger.warning("Corrupt chunk at idx %d (attempt %d), resampling",
+                               idx, attempt)
+                idx = int(self.rng.integers(len(self._samples)))
+        # Final attempt; let a persistent failure surface rather than loop forever
+        return self._getitem_inner(idx)
 
     def _getitem_inner(self, idx: int) -> dict[str, torch.Tensor]:
         t0, row, col, sidx = self._samples[idx]
