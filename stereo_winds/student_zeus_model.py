@@ -62,7 +62,10 @@ class StudentWindsModel(BaseLightningModule):
         log_media_step: int = 200,
         predict_chi2: bool = False,
         w_chi2: float = 0.1,
+        w_chi2_dist: float = 0.0,
         w_speed: float = 0.0,
+        chi2_separate_head: bool = False,
+        chi2_stop_grad: bool = False,
         **kwargs,
     ):
         # Radiance is standardized per band×frame by the zeus StandardScalar
@@ -98,6 +101,12 @@ class StudentWindsModel(BaseLightningModule):
         # right tail of solver residuals.
         self.predict_chi2 = bool(predict_chi2)
         self.w_chi2 = float(w_chi2)
+        # Distribution-matching loss on log(chi²): symmetric Gaussian KL
+        # between batch-level (μ, σ²) of predicted vs teacher log(chi²) on
+        # masked pixels.  Addresses the "student compresses chi² distribution"
+        # failure where the per-pixel L1 lets the head learn an over-narrow,
+        # right-shifted distribution.  Default 0 (off) for back-compat.
+        self.w_chi2_dist = float(w_chi2_dist)
         # Optional speed-magnitude loss: addresses the systematic ~-3 m/s
         # under-prediction of wind speed in vector-NLL training (where the
         # data term is componentwise on u,v and smoothing biases magnitude
@@ -112,6 +121,8 @@ class StudentWindsModel(BaseLightningModule):
                 in_channels=in_channels, hidden=hidden, n_layers=n_layers,
                 context=context, wind_logvar_mode=wlm,
                 predict_chi2=self.predict_chi2,
+                chi2_separate_head=chi2_separate_head,
+                chi2_stop_grad=chi2_stop_grad,
             )
         elif trunk == "unet":
             self.net = UNetWindStudent(
@@ -120,6 +131,8 @@ class StudentWindsModel(BaseLightningModule):
                 n_levels=unet_n_levels,
                 wind_logvar_mode=wlm,
                 predict_chi2=self.predict_chi2,
+                chi2_separate_head=chi2_separate_head,
+                chi2_stop_grad=chi2_stop_grad,
             )
         else:
             raise ValueError(f"trunk must be 'pixelwise' or 'unet', got {trunk!r}")
@@ -311,6 +324,31 @@ class StudentWindsModel(BaseLightningModule):
             chi2_l1 = (chi2_resid * w * mask.float()).sum() / w_sum
             loss = loss + self.w_chi2 * chi2_l1
             self.log(f"{m}/chi2_l1", chi2_l1, batch_size=bs)
+
+            # Distribution-matching loss: symmetric Gaussian KL between
+            # batch-level (μ, σ²) of predicted and teacher log(chi²) on
+            # masked pixels.  Per-pixel L1 alone lets the head produce a
+            # narrowed, right-shifted log-chi² distribution that
+            # systematically excludes high-wind pixels at the QA gate.
+            # Matching the moments of log(chi²) pushes the head to
+            # reproduce the teacher's full chi² distribution.
+            if self.w_chi2_dist > 0 and mask.sum() > 1:
+                lp = out["log_chi2"][mask]
+                lt = log_chi2_t[mask]
+                mu_p = lp.mean(); mu_t = lt.mean()
+                # +eps to keep std positive; unbiased=False for stability with
+                # small mask counts at the start of training.
+                sd_p = lp.std(unbiased=False).clamp_min(1e-3)
+                sd_t = lt.std(unbiased=False).clamp_min(1e-3)
+                # Symmetric KL(N(μ_p, σ_p²) || N(μ_t, σ_t²)) — sum of both directions.
+                kl_pt = torch.log(sd_t / sd_p) + (sd_p.pow(2) + (mu_p - mu_t).pow(2)) / (2 * sd_t.pow(2)) - 0.5
+                kl_tp = torch.log(sd_p / sd_t) + (sd_t.pow(2) + (mu_t - mu_p).pow(2)) / (2 * sd_p.pow(2)) - 0.5
+                chi2_dist = 0.5 * (kl_pt + kl_tp)
+                loss = loss + self.w_chi2_dist * chi2_dist
+                self.log(f"{m}/chi2_dist", chi2_dist, batch_size=bs)
+                self.log(f"{m}/log_chi2_mu_pred", mu_p, batch_size=bs)
+                self.log(f"{m}/log_chi2_sd_pred", sd_p, batch_size=bs)
+                self.log(f"{m}/log_chi2_mu_tgt", mu_t, batch_size=bs)
 
         with torch.no_grad():
             if mask.any():

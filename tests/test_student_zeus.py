@@ -365,6 +365,126 @@ class TestSpeedMagnitudeLoss:
                any("speed_mse" in k for k in trainer.logged_metrics)
 
 
+class TestChi2SeparateHead:
+    """Decoupled chi² head — own conv layer + optional stop-grad on trunk
+    to break the chi²-vs-wind capacity competition."""
+
+    def test_separate_head_creates_extra_module(self, tmp_path):
+        from stereo_winds.student_model import PixelwiseWindStudent, UNetWindStudent
+        # Pixelwise
+        m = PixelwiseWindStudent(
+            in_channels=8, hidden=16, n_layers=2,
+            wind_logvar_mode="joint",
+            predict_chi2=True, chi2_separate_head=True)
+        # Main head should NOT include the chi² channel anymore.
+        assert m.head.out_channels == 5  # joint = 5 (no chi² mixed in)
+        assert hasattr(m, "chi2_head")
+        assert m.chi2_head.out_channels == 1
+        # UNet
+        u = UNetWindStudent(
+            in_channels=8, base_channels=8, n_levels=2,
+            wind_logvar_mode="joint",
+            predict_chi2=True, chi2_separate_head=True)
+        assert u.head.out_channels == 5
+        assert hasattr(u, "chi2_head")
+
+    def test_stop_grad_blocks_trunk_update_from_chi2(self, tmp_path):
+        """chi² loss must not flow gradients into the trunk when stop_grad=True."""
+        from stereo_winds.student_model import PixelwiseWindStudent
+        m = PixelwiseWindStudent(
+            in_channels=8, hidden=16, n_layers=2,
+            wind_logvar_mode="joint",
+            predict_chi2=True, chi2_separate_head=True, chi2_stop_grad=True)
+        x = torch.randn(2, 8, 16, 16, requires_grad=False)
+        out = m(x)
+        # Compute a loss purely on log_chi2 and check trunk grads are None.
+        loss = out["log_chi2"].mean()
+        loss.backward()
+        trunk_grad_norms = sum(
+            p.grad.abs().sum().item() if p.grad is not None else 0.0
+            for p in m.trunk.parameters()
+        )
+        assert trunk_grad_norms == 0.0, \
+            f"stop_grad failed: trunk got grad sum={trunk_grad_norms}"
+        # chi2_head WAS updated.
+        chi2_head_grad = sum(
+            p.grad.abs().sum().item() if p.grad is not None else 0.0
+            for p in m.chi2_head.parameters()
+        )
+        assert chi2_head_grad > 0.0
+
+    def test_without_stop_grad_trunk_does_update(self, tmp_path):
+        """Sanity: with stop_grad=False the trunk DOES receive chi² grads."""
+        from stereo_winds.student_model import PixelwiseWindStudent
+        m = PixelwiseWindStudent(
+            in_channels=8, hidden=16, n_layers=2,
+            wind_logvar_mode="joint",
+            predict_chi2=True, chi2_separate_head=True, chi2_stop_grad=False)
+        x = torch.randn(2, 8, 16, 16, requires_grad=False)
+        out = m(x)
+        loss = out["log_chi2"].mean()
+        loss.backward()
+        trunk_grad_norms = sum(
+            p.grad.abs().sum().item() if p.grad is not None else 0.0
+            for p in m.trunk.parameters()
+        )
+        assert trunk_grad_norms > 0.0
+
+    def test_two_step_fit_with_stop_grad(self, tmp_path):
+        """Full Lightning loop with separate-head + stop-grad."""
+        import pytorch_lightning as pl
+        f, l = _build_with_chi2(tmp_path)
+        ds = StudentXBatchDataset(
+            feature_zarr=f, label_zarr=l, flow_bands=FLOW_BANDS,
+            rad_bands=RAD_BANDS, patch_size=16, train=True, seed=0)
+        loader = DataLoader(ds, batch_size=2, num_workers=0)
+        model = StudentWindsModel(
+            n_flow_bands=len(FLOW_BANDS), n_rad_bands=len(RAD_BANDS),
+            hidden=16, n_layers=2, wind_loss="vector",
+            predict_chi2=True, w_chi2=1.0,
+            chi2_separate_head=True, chi2_stop_grad=True)
+        model.prepare_data_transformation(loader, n_batches=1)
+        model.fit_target_stats(loader, n_batches=1)
+        trainer = pl.Trainer(max_steps=2, accelerator="cpu", logger=False,
+                             enable_checkpointing=False, enable_progress_bar=False)
+        trainer.fit(model, loader)
+        # Forward still produces chi²
+        b = next(iter(loader))
+        out = model.predict(b["flow"], b["rad"], b["geom"])
+        assert "chi2" in out
+
+
+class TestChi2DistLoss:
+    """KL-style distribution-matching loss on log(chi²)."""
+
+    def test_w_chi2_dist_logs_dist_loss(self, tmp_path):
+        """When w_chi2_dist > 0 and chi² targets are present, the
+        distribution-matching loss is computed and logged."""
+        import pytorch_lightning as pl
+        f, l = _build_with_chi2(tmp_path)
+        ds = StudentXBatchDataset(
+            feature_zarr=f, label_zarr=l, flow_bands=FLOW_BANDS,
+            rad_bands=RAD_BANDS, patch_size=16, train=True, seed=0)
+        loader = DataLoader(ds, batch_size=2, num_workers=0)
+        model = StudentWindsModel(
+            n_flow_bands=len(FLOW_BANDS), n_rad_bands=len(RAD_BANDS),
+            hidden=16, n_layers=2, wind_loss="vector",
+            predict_chi2=True, w_chi2=0.1, w_chi2_dist=1.0,
+            chi2_separate_head=True, chi2_stop_grad=True)
+        model.prepare_data_transformation(loader, n_batches=1)
+        model.fit_target_stats(loader, n_batches=1)
+        trainer = pl.Trainer(max_steps=2, accelerator="cpu", logger=False,
+                             enable_checkpointing=False, enable_progress_bar=False)
+        trainer.fit(model, loader)
+        assert any("chi2_dist" in k for k in trainer.logged_metrics), \
+            f"chi2_dist not logged; metrics: {list(trainer.logged_metrics)}"
+
+    def test_default_w_chi2_dist_zero(self):
+        m = StudentWindsModel(n_flow_bands=1, n_rad_bands=1, hidden=8,
+                              n_layers=1, predict_chi2=True)
+        assert m.w_chi2_dist == 0.0
+
+
 class TestStudentZeusModel:
     def test_forward_and_transform(self, tmp_path):
         ds = _ds(tmp_path)

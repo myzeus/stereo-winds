@@ -97,6 +97,8 @@ class PixelwiseWindStudent(nn.Module):
         logvar_max: float = 10.0,
         wind_logvar_mode: str = "per_component",
         predict_chi2: bool = False,
+        chi2_separate_head: bool = False,
+        chi2_stop_grad: bool = False,
     ):
         super().__init__()
         if n_layers < 1:
@@ -110,6 +112,12 @@ class PixelwiseWindStudent(nn.Module):
         self.logvar_max = logvar_max
         self.wind_logvar_mode = wind_logvar_mode
         self.predict_chi2 = predict_chi2
+        # ``chi2_separate_head`` puts the chi² output in its own conv layer
+        # so it can be decoupled from the wind head; ``chi2_stop_grad`` then
+        # detaches the trunk features before the chi² head, keeping the
+        # trunk solely shaped by wind+h losses.
+        self.chi2_separate_head = predict_chi2 and chi2_separate_head
+        self.chi2_stop_grad = predict_chi2 and chi2_separate_head and chi2_stop_grad
 
         layers: list[nn.Module] = []
         if context:
@@ -130,9 +138,12 @@ class PixelwiseWindStudent(nn.Module):
 
         # per_component: 6 outputs (u_mean, v_mean, h_mean, u_logvar, v_logvar, h_logvar)
         # joint:         5 outputs (u_mean, v_mean, h_mean, uv_logvar, h_logvar)
-        # + 1 extra log_chi2 channel when predict_chi2.
-        self.n_out = head_n_out(wind_logvar_mode, predict_chi2)
+        # + 1 extra log_chi2 channel when predict_chi2 (unless --chi2-separate-head).
+        head_predict_chi2 = predict_chi2 and not self.chi2_separate_head
+        self.n_out = head_n_out(wind_logvar_mode, head_predict_chi2)
         self.head = nn.Conv2d(hidden, self.n_out, 1)
+        if self.chi2_separate_head:
+            self.chi2_head = nn.Conv2d(hidden, 1, 1)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         """
@@ -152,11 +163,22 @@ class PixelwiseWindStudent(nn.Module):
         denormalizes predictions for inference.  Unbounded (no tanh/sigmoid)
         so gradients flow freely through the O(1) standardized range.
         """
-        raw = self.head(self.trunk(x))
-        return _hetero_head_outputs(
+        feats = self.trunk(x)
+        raw = self.head(feats)
+        # When chi2_separate_head=True, the main head emits only wind+h
+        # channels and predict_chi2 in _hetero_head_outputs is False; the
+        # log_chi2 channel comes from the dedicated chi2_head.
+        head_predict_chi2 = self.predict_chi2 and not self.chi2_separate_head
+        out = _hetero_head_outputs(
             raw, self.wind_logvar_mode, self.logvar_min, self.logvar_max,
-            predict_chi2=self.predict_chi2,
+            predict_chi2=head_predict_chi2,
         )
+        if self.chi2_separate_head:
+            # stop_grad: trunk doesn't get gradient signal from chi² loss,
+            # so its features are shaped solely by the wind+h objectives.
+            f = feats.detach() if self.chi2_stop_grad else feats
+            out["log_chi2"] = self.chi2_head(f).squeeze(1)
+        return out
 
 
 def _double_conv(in_ch: int, out_ch: int, gn_groups: int = 8) -> nn.Sequential:
@@ -210,6 +232,8 @@ class UNetWindStudent(nn.Module):
         logvar_max: float = 10.0,
         wind_logvar_mode: str = "per_component",
         predict_chi2: bool = False,
+        chi2_separate_head: bool = False,
+        chi2_stop_grad: bool = False,
     ):
         super().__init__()
         if wind_logvar_mode not in ("per_component", "joint"):
@@ -224,6 +248,8 @@ class UNetWindStudent(nn.Module):
         self.logvar_max = logvar_max
         self.wind_logvar_mode = wind_logvar_mode
         self.predict_chi2 = predict_chi2
+        self.chi2_separate_head = predict_chi2 and chi2_separate_head
+        self.chi2_stop_grad = predict_chi2 and chi2_separate_head and chi2_stop_grad
         self.n_levels = n_levels
 
         # Channel widths per level: [base, 2*base, 4*base, ...]
@@ -245,9 +271,13 @@ class UNetWindStudent(nn.Module):
             skip_ch = widths[i]
             self.decoders.append(_double_conv(up_ch + skip_ch, skip_ch))
 
-        # per_component: 6 outputs; joint: 5 outputs (+1 for chi²).
-        self.n_out = head_n_out(wind_logvar_mode, predict_chi2)
+        # per_component: 6 outputs; joint: 5 outputs (+1 for chi² unless
+        # chi2_separate_head, in which case chi² has its own 1×1 conv).
+        head_predict_chi2 = predict_chi2 and not self.chi2_separate_head
+        self.n_out = head_n_out(wind_logvar_mode, head_predict_chi2)
         self.head = nn.Conv2d(widths[0], self.n_out, 1)
+        if self.chi2_separate_head:
+            self.chi2_head = nn.Conv2d(widths[0], 1, 1)
 
     def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         skips = []
@@ -265,7 +295,12 @@ class UNetWindStudent(nn.Module):
             h = torch.cat([h, skip], dim=1)
             h = dec(h)
         raw = self.head(h)
-        return _hetero_head_outputs(
+        head_predict_chi2 = self.predict_chi2 and not self.chi2_separate_head
+        out = _hetero_head_outputs(
             raw, self.wind_logvar_mode, self.logvar_min, self.logvar_max,
-            predict_chi2=self.predict_chi2,
+            predict_chi2=head_predict_chi2,
         )
+        if self.chi2_separate_head:
+            f = h.detach() if self.chi2_stop_grad else h
+            out["log_chi2"] = self.chi2_head(f).squeeze(1)
+        return out
