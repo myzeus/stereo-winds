@@ -1,6 +1,7 @@
 """Train RAFT for stereo wind retrieval (EarthCARE or IGRA sonde supervision)."""
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -109,6 +110,19 @@ if __name__ == "__main__":
     parser.add_argument("--wind-reg-weight", type=float, default=0.0)
     parser.add_argument("--iters", type=int, default=12,
                         help="RAFT refinement iterations per forward pass")
+    parser.add_argument("--val-months", default=None,
+                        help="Comma-separated months (YYYYMM or YYYY-MM) held out "
+                             "as a temporal test set (sonde mode only). These months "
+                             "are excluded from training; combined with the held-out "
+                             "stations (IGRADataset val split) they form a test set "
+                             "independent in both space and time. Default: none "
+                             "(station-only split, original behavior).")
+    parser.add_argument("--resume-from-ckpt", default=None,
+                        help="Path to a Lightning checkpoint to RESUME from "
+                             "(restores optimizer, LR schedule, and global step "
+                             "via trainer.fit(ckpt_path=...)). Use to continue an "
+                             "interrupted run to --max-steps. Note: --raft-ckpt "
+                             "init weights are overridden by the resume state.")
     args = parser.parse_args()
 
     RAFT_CKPT = args.raft_ckpt
@@ -127,6 +141,13 @@ if __name__ == "__main__":
     multiband = args.band == "all"
     bands = ALL_BANDS if multiband else [args.band]
 
+    # Months held out as a temporal test set (normalized to YYYYMM).
+    VAL_MONTHS = {
+        tok.strip().replace("-", "")
+        for tok in (args.val_months or "").split(",")
+        if tok.strip()
+    }
+
     print(f"MODE={args.mode}, BAND={args.band}, EC_WEIGHT={EC_WEIGHT}, "
           f"SONDE_WEIGHT={SONDE_WEIGHT}, MAX_EPOCHS={MAX_EPOCHS}")
     print(f"DATA_DIR={DATA_DIR}")
@@ -136,15 +157,22 @@ if __name__ == "__main__":
     print(f"IGRA_PARQUET={IGRA_COLLOCATION}")
     print(f"OUTPUT_DIR={OUTPUT_DIR}")
 
-    # Build per-month datasets and concatenate
-    per_month = []
-    if multiband and args.mode == "sonde":
-        # Multi-band: group pairs by month, each dataset randomly selects a band
-        month_bands = _gather_multiband_by_month(DATA_DIR, bands)
-        for month_key, band_pairs in sorted(month_bands.items()):
-            a_list = [str(p[0]) for p in band_pairs]
-            b_list = [str(p[1]) for p in band_pairs]
-            print(f"  Loading {month_key}: {len(band_pairs)} bands")
+    def _ym(s: str) -> str | None:
+        """Extract the YYYYMM token from a month_key or zarr filename."""
+        m = re.search(r"(\d{6})", str(s))
+        return m.group(1) if m else None
+
+    def _build_igra(entries, train_flag):
+        """Build IGRADatasets from (ym, label, a_list, b_list) entries.
+
+        train_flag controls the *station* split inside IGRADataset (held-out
+        stations when False). Combined with the month-level partition below,
+        the val set is held out in both station (space) and month (time).
+        """
+        out = []
+        for ym, label, a_list, b_list in entries:
+            tag = "TRAIN" if train_flag else "VAL"
+            print(f"  [{tag}] Loading {label} (ym={ym}): {len(a_list)} band(s)")
             try:
                 ds = IGRADataset(
                     sat_a_zarr=a_list,
@@ -153,7 +181,7 @@ if __name__ == "__main__":
                     valid_mask_path=VALID_MASK,
                     igra_collocation_path=IGRA_COLLOCATION,
                     patch_size=args.patch_size,
-                    train=True,
+                    train=train_flag,
                     label_radius=args.label_radius,
                     seed=42,
                 )
@@ -161,41 +189,72 @@ if __name__ == "__main__":
                 print(f"    SKIP — {type(e).__name__}: {e}")
                 continue
             if len(ds) > 0:
-                per_month.append(ds)
-                print(f"    → {len(ds)} patches ({len(band_pairs)} bands per sample)")
+                out.append(ds)
+                print(f"    → {len(ds)} patches")
             else:
                 print(f"    → 0 patches, skipping")
+        return out
+
+    # Build per-month datasets, partitioned into train and held-out-month val.
+    per_month = []
+    val_loader = None
+    if args.mode == "sonde":
+        # Gather month entries as (ym, label, a_list, b_list).
+        month_entries = []
+        if multiband:
+            month_bands = _gather_multiband_by_month(DATA_DIR, bands)
+            for month_key, band_pairs in sorted(month_bands.items()):
+                month_entries.append((
+                    _ym(month_key), month_key,
+                    [str(p[0]) for p in band_pairs],
+                    [str(p[1]) for p in band_pairs],
+                ))
+        else:
+            for a_zarr, b_zarr in _gather_pairs(DATA_DIR, args.band):
+                month_entries.append((
+                    _ym(a_zarr.name), a_zarr.name, [str(a_zarr)], [str(b_zarr)],
+                ))
+
+        train_entries = [e for e in month_entries if e[0] not in VAL_MONTHS]
+        val_entries = [e for e in month_entries if e[0] in VAL_MONTHS]
+        if VAL_MONTHS:
+            print(f"Temporal split: holding out months {sorted(VAL_MONTHS)} "
+                  f"(matched {len({e[0] for e in val_entries})} of them in data); "
+                  f"training on months {sorted({e[0] for e in train_entries})}")
+            missing = VAL_MONTHS - {e[0] for e in month_entries}
+            if missing:
+                print(f"  WARNING: --val-months {sorted(missing)} not present in DATA_DIR")
+
+        print("Building TRAIN datasets...")
+        per_month = _build_igra(train_entries, train_flag=True)
+        if val_entries:
+            print("Building VAL datasets (held-out months × held-out stations)...")
+            val_ds_list = _build_igra(val_entries, train_flag=False)
+            if val_ds_list:
+                val_dataset = ConcatDataset(val_ds_list)
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=args.batch_size,
+                    num_workers=args.num_workers,
+                    shuffle=False,
+                    pin_memory=True,
+                    persistent_workers=args.num_workers > 0,
+                )
+                print(f"Val: {len(val_dataset)} patches across "
+                      f"{len(val_ds_list)} held-out month(s)")
     else:
-        # Single band
-        SAT_PAIRS = _gather_pairs(DATA_DIR, args.band)
-        SAT_A_ZARR = [p[0] for p in SAT_PAIRS]
-        SAT_B_ZARR = [p[1] for p in SAT_PAIRS]
-        print(f"Sat A stores: {[p.name for p in SAT_A_ZARR]}")
-        print(f"Sat B stores: {[p.name for p in SAT_B_ZARR]}")
-        for a_zarr, b_zarr in zip(SAT_A_ZARR, SAT_B_ZARR):
+        # EarthCARE single-band path (no temporal split)
+        for a_zarr, b_zarr in _gather_pairs(DATA_DIR, args.band):
             print(f"  Loading {a_zarr.name} + {b_zarr.name}")
             try:
-                if args.mode == "earthcare":
-                    ds = EarthCAREDataset(
-                        sat_a_zarr=str(a_zarr),
-                        sat_b_zarr=str(b_zarr),
-                        parallax_path=PARALLAX,
-                        valid_mask_path=VALID_MASK,
-                        ec_collocation_path=EC_COLLOCATION,
-                        seed=42,
-                    )
-                else:
-                    ds = IGRADataset(
-                        sat_a_zarr=str(a_zarr),
-                        sat_b_zarr=str(b_zarr),
-                        parallax_path=PARALLAX,
-                        valid_mask_path=VALID_MASK,
-                        igra_collocation_path=IGRA_COLLOCATION,
-                        patch_size=args.patch_size,
-                        train=True,
-                        label_radius=args.label_radius,
-                        seed=42,
-                    )
+                ds = EarthCAREDataset(
+                    sat_a_zarr=str(a_zarr),
+                    sat_b_zarr=str(b_zarr),
+                    parallax_path=PARALLAX,
+                    valid_mask_path=VALID_MASK,
+                    ec_collocation_path=EC_COLLOCATION,
+                    seed=42,
+                )
             except Exception as e:
                 print(f"    SKIP — {type(e).__name__}: {e}")
                 continue
@@ -206,7 +265,7 @@ if __name__ == "__main__":
                 print(f"    → 0 patches, skipping")
 
     dataset = ConcatDataset(per_month)
-    print(f"Total: {len(dataset)} patches across {len(per_month)} months")
+    print(f"Total (train): {len(dataset)} patches across {len(per_month)} months")
 
     loader = DataLoader(
         dataset,
@@ -259,9 +318,13 @@ if __name__ == "__main__":
         precision="32-true",
         gradient_clip_val=1.0,
         log_every_n_steps=10,
+        num_sanity_val_steps=0,
         callbacks=[every_epoch_ckpt],
         logger=logger,
         default_root_dir=str(OUTPUT_DIR),
     )
 
-    trainer.fit(module, loader)
+    if args.resume_from_ckpt:
+        print(f"RESUMING from checkpoint: {args.resume_from_ckpt}")
+    trainer.fit(module, loader, val_dataloaders=val_loader,
+                ckpt_path=args.resume_from_ckpt)
