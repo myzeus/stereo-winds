@@ -121,12 +121,33 @@ def main():
                    help="Weight on the chi²-distillation L1 loss term "
                         "(only used when --predict-chi2). Default 0.1 keeps "
                         "it modest vs the wind/h NLL budget.")
+    p.add_argument("--w-chi2-dist", type=float, default=0.0,
+                   help="(--predict-chi2 only) Weight on the symmetric "
+                        "Gaussian KL between batch-level (μ, σ²) of "
+                        "predicted vs teacher log(chi²) on masked pixels. "
+                        "Counters the distribution-compression failure where "
+                        "the chi² head over-narrows its predictions and the "
+                        "QA gate ends up excluding all high-wind pixels.")
     p.add_argument("--w-speed", type=float, default=0.0,
                    help="Weight on the speed-magnitude MSE penalty "
                         "((|V_pred| - |V_teacher|)²). 0 disables. Use to "
                         "counteract the systematic ~-3 m/s under-prediction "
                         "of wind speed observed with vector NLL alone "
                         "(componentwise smoothing biases magnitude → 0).")
+    p.add_argument("--chi2-separate-head", dest="chi2_separate_head",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="(--predict-chi2 only) Use a dedicated 1×1 conv for "
+                        "the chi² output instead of sharing the wind head's "
+                        "channels. Prerequisite for --chi2-stop-grad.")
+    p.add_argument("--chi2-stop-grad", dest="chi2_stop_grad",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="(--chi2-separate-head only) Detach the trunk "
+                        "features before the chi² head so chi² gradients "
+                        "never update the U-Net trunk. The trunk is shaped "
+                        "solely by wind+h losses; the chi² head learns to "
+                        "predict log(teacher_chi²) from those features. "
+                        "Targets the chi²-vs-wind capacity competition "
+                        "we measured (~2.5 m/s apples-to-apples cost).")
     p.add_argument("--early-stop-patience", type=int, default=5,
                    help="Stop training if eval/rmsvd doesn't improve for N "
                         "consecutive evals (only active when --val-months is "
@@ -193,7 +214,10 @@ def main():
         rad_time_frames=args.rad_time_frames,
         predict_chi2=args.predict_chi2,
         w_chi2=args.w_chi2,
+        w_chi2_dist=args.w_chi2_dist,
         w_speed=args.w_speed,
+        chi2_separate_head=args.chi2_separate_head,
+        chi2_stop_grad=args.chi2_stop_grad,
         learning_rate=args.lr,
     )
 
