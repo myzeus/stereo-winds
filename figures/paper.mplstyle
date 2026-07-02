@@ -1,0 +1,33 @@
+# Shared matplotlib style for stereo-winds paper figures.
+# Use via: plt.style.use("figures/paper.mplstyle")
+# The height colormap for all figures lives here as image.cmap (cividis,
+# perceptually uniform — never jet/turbo). Figure code reads it back via
+# plt.rcParams["image.cmap"] so there is a single source of truth.
+
+# Fonts
+font.family:        sans-serif
+font.sans-serif:    DejaVu Sans, Arial, Helvetica
+font.size:          9
+axes.titlesize:     10
+axes.labelsize:     9
+xtick.labelsize:    8
+ytick.labelsize:    8
+legend.fontsize:    8
+figure.titlesize:   12
+
+# Colormap (single source of truth for retrieved-height coloring)
+image.cmap:         viridis
+
+# Lines / axes
+axes.linewidth:     0.6
+axes.titleweight:   bold
+lines.linewidth:    1.0
+xtick.direction:    out
+ytick.direction:    out
+
+# Output
+figure.dpi:         150
+savefig.dpi:        300
+savefig.bbox:       tight
+savefig.facecolor:  white
+figure.facecolor:   white
