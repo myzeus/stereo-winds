@@ -60,6 +60,12 @@ def main():
     ap.add_argument("--sat-a", default="goes19", choices=list(SATELLITE_CONFIGS))
     ap.add_argument("--sat-b", default="goes18", choices=list(SATELLITE_CONFIGS))
     ap.add_argument("--teacher-band", default="C14")
+    ap.add_argument("--per-band-labels", action="store_true",
+                    help="Solve the teacher WLS per flow band and store per-band "
+                         "labels u_wind_<b>/v_wind_<b>/cloud_top_height_<b>/"
+                         "quality_flag_<b>/chi_squared_<b>/sigma_h_<b> for the "
+                         "multi-band student. Reuses per-band temporal flow; adds "
+                         "one cross-sat flow + solve per band.")
     ap.add_argument("--flow-bands", default=",".join(DEFAULT_FLOW_BANDS))
     ap.add_argument("--rad-bands", default=",".join(DEFAULT_RAD_BANDS))
     ap.add_argument("--months", required=True, help="Comma-separated YYYYMM list")
@@ -127,9 +133,16 @@ def main():
     def a_cube(b, mm):
         return xr.open_zarr(os.path.join(args.data_dir, f"{args.sat_a}_{b}_{mm}.zarr"))
 
-    def b_cube(mm):
+    def b_cube(mm, band=None):
+        band = band or tb
         return xr.open_zarr(os.path.join(
-            args.data_dir, f"{args.sat_b}_remap_{args.sat_a}_{tb}_{mm}.zarr"))
+            args.data_dir, f"{args.sat_b}_remap_{args.sat_a}_{band}_{mm}.zarr"))
+
+    # Per-band label var names, e.g. u_wind_C08. Order follows flow_bands.
+    PB_LABEL_VARS = ["u_wind", "v_wind", "cloud_top_height",
+                     "quality_flag", "chi_squared", "sigma_h"]
+    def pb_var(v, b):
+        return f"{v}_{b}"
 
     # Eligible center times = ACTUAL cube times with t0+/-10 present in A and B
     # (the cubes are not aligned to HH:00).
@@ -184,9 +197,13 @@ def main():
                            overlap=args.overlap, batch_size=8, device="cuda")
 
     FLOW_KEYS = ["flow_back_u", "flow_back_v", "flow_fwd_u", "flow_fwd_v"]
-    buf = {k: [] for k in
-           ["u_wind", "v_wind", "cloud_top_height", "quality_flag",
-            "chi_squared", "sigma_h", "sigma_u", "sigma_v"]}
+    if args.per_band_labels:
+        # One label tuple per flow band (multi-band student).
+        buf = {pb_var(v, b): [] for b in flow_bands for v in PB_LABEL_VARS}
+    else:
+        buf = {k: [] for k in
+               ["u_wind", "v_wind", "cloud_top_height", "quality_flag",
+                "chi_squared", "sigma_h", "sigma_u", "sigma_v"]}
     for b in flow_bands:
         for k in FLOW_KEYS:
             buf[flow_var(k, b)] = []
@@ -210,6 +227,9 @@ def main():
                          flow_bands=",".join(flow_bands), rad_bands=",".join(rad_bands),
                          rad_time_frames=3,
                          teacher_band=tb, satellite_id=SAT_A.satellite_id)
+        if args.per_band_labels:
+            # wind_bands drives the multi-band loader's per-band label stacking.
+            out.attrs["wind_bands"] = ",".join(flow_bands)
         path = os.path.join(args.out_dir, f"chunk_{chunk_idx:03d}.zarr")
         out.to_zarr(path, mode="w")
         print(f"  wrote {path} ({len(buf_times)} scenes)", flush=True)
@@ -228,7 +248,8 @@ def main():
     for i, (mm, t0) in enumerate(eval_times):
         if mm != cur_mm:
             ca = {b: a_cube(b, mm) for b in all_bands}
-            cb = b_cube(mm)
+            cb = ({b: b_cube(mm, b) for b in flow_bands}
+                  if args.per_band_labels else b_cube(mm))
             cur_mm = mm
         print(f"[{i+1}/{len(eval_times)}] {mm} {t0}", flush=True)
         crop = (slice(tr0, tr0 + bh), slice(tc0, tc0 + bw))
@@ -249,44 +270,77 @@ def main():
                 flows_band[b] = (fb[:, crop[0], crop[1]], ff[:, crop[0], crop[1]])
                 a0c[b] = (a_m, a_0, a_p, vb)
 
-            # Teacher cross-sat pairs (teacher band), trim to bbox.
-            # a0c entries are (a_m, a_0, a_p, vb) since the temporal-frame change.
-            tb_tuple = a0c.get(tb)
-            if tb_tuple is None:
-                a0_tb = load_run(ca[tb], t0); vtb = np.isfinite(a0_tb)
+            if args.per_band_labels:
+                # Multi-band: solve the WLS separately for each flow band, each
+                # with its OWN cross-sat pair (sat-B remap of that band). The
+                # per-band temporal flows (D1,D2) are already in flows_band[b].
+                rec = {}
+                for b in flow_bands:
+                    _a_m, a0_b, _a_p, vb_b = a0c[b]
+                    bm = load_run(cb[b], t0 - delta)
+                    bp = load_run(cb[b], t0 + delta)
+                    valid_b = vb_b & np.isfinite(bm) & np.isfinite(bp)
+                    d3 = disp._run_pair(a0_b, bm)[:, crop[0], crop[1]]
+                    d4 = disp._run_pair(a0_b, bp)[:, crop[0], crop[1]]
+                    vbbox_b = valid_b[crop[0], crop[1]]
+                    d1, d2 = flows_band[b]
+                    flows_b = {"D1": d1.copy(), "D2": d2.copy(), "D3": d3, "D4": d4}
+                    for k in flows_b:
+                        flows_b[k][:, ~vbbox_b] = np.nan
+                    sol = solve_stereo_winds(
+                        flows_b, H_matrix, sat_a=SAT_A, sat_b=SAT_B,
+                        n_iter=args.n_iter, device=args.solver_device)
+                    u_ms = sol["V_u"] * geom["dx_m"]
+                    v_ms = sol["V_v"] * geom["dy_m"]
+                    qf = compute_qa_flag(
+                        {"h": sol["h"], "chi2": sol["chi2"], "sigma_h": sol["sigma_h"],
+                         "u_wind": u_ms, "v_wind": v_ms}, vbbox_b).astype(np.float32)
+                    qf[~vbbox_b] = 0.0
+                    rec[pb_var("u_wind", b)] = u_ms
+                    rec[pb_var("v_wind", b)] = v_ms
+                    rec[pb_var("cloud_top_height", b)] = sol["h"]
+                    rec[pb_var("quality_flag", b)] = qf
+                    rec[pb_var("chi_squared", b)] = sol["chi2"]
+                    rec[pb_var("sigma_h", b)] = sol["sigma_h"]
             else:
-                _a_m, a0_tb, _a_p, vtb = tb_tuple
-            b_m, b_p = load_run(cb, t0 - delta), load_run(cb, t0 + delta)
-            valid = vtb & np.isfinite(b_m) & np.isfinite(b_p)
-            d3 = disp._run_pair(a0_tb, b_m)[:, crop[0], crop[1]]
-            d4 = disp._run_pair(a0_tb, b_p)[:, crop[0], crop[1]]
-            vbbox = valid[crop[0], crop[1]]
-            d1, d2 = flows_band[tb]  # reuse teacher-band temporal flows
-            flows = {"D1": d1.copy(), "D2": d2.copy(), "D3": d3, "D4": d4}
-            for k in flows:
-                flows[k][:, ~vbbox] = np.nan
+                # Teacher cross-sat pairs (teacher band), trim to bbox.
+                # a0c entries are (a_m, a_0, a_p, vb) since the temporal-frame change.
+                tb_tuple = a0c.get(tb)
+                if tb_tuple is None:
+                    a0_tb = load_run(ca[tb], t0); vtb = np.isfinite(a0_tb)
+                else:
+                    _a_m, a0_tb, _a_p, vtb = tb_tuple
+                b_m, b_p = load_run(cb, t0 - delta), load_run(cb, t0 + delta)
+                valid = vtb & np.isfinite(b_m) & np.isfinite(b_p)
+                d3 = disp._run_pair(a0_tb, b_m)[:, crop[0], crop[1]]
+                d4 = disp._run_pair(a0_tb, b_p)[:, crop[0], crop[1]]
+                vbbox = valid[crop[0], crop[1]]
+                d1, d2 = flows_band[tb]  # reuse teacher-band temporal flows
+                flows = {"D1": d1.copy(), "D2": d2.copy(), "D3": d3, "D4": d4}
+                for k in flows:
+                    flows[k][:, ~vbbox] = np.nan
 
-            sol = solve_stereo_winds(flows, H_matrix, sat_a=SAT_A, sat_b=SAT_B,
-                                     n_iter=args.n_iter, device=args.solver_device)
-            # u_wind / v_wind in m/s (pixels_to_wind for compute_qa_flag's speed gate).
-            u_ms = sol["V_u"] * geom["dx_m"]
-            v_ms = sol["V_v"] * geom["dy_m"]
-            # Rich Level 0/1/2 QA from chi² / sigma_h / |∇h| / speed gates — same
-            # logic backfill_qa_local.py applies; doing it inline keeps future
-            # chunks self-consistent without needing a post-write backfill.
-            qa_sol = {
-                "h": sol["h"], "chi2": sol["chi2"], "sigma_h": sol["sigma_h"],
-                "u_wind": u_ms, "v_wind": v_ms,
-            }
-            qf = compute_qa_flag(qa_sol, vbbox).astype(np.float32)
-            qf[~vbbox] = 0.0
-            # px/s -> m/s with the bbox-cropped ground scale (reuse u_ms/v_ms).
-            rec = {
-                "u_wind": u_ms, "v_wind": v_ms,
-                "cloud_top_height": sol["h"], "quality_flag": qf,
-                "chi_squared": sol["chi2"], "sigma_h": sol["sigma_h"],
-                "sigma_u": sol["sigma_u"], "sigma_v": sol["sigma_v"],
-            }
+                sol = solve_stereo_winds(flows, H_matrix, sat_a=SAT_A, sat_b=SAT_B,
+                                         n_iter=args.n_iter, device=args.solver_device)
+                # u_wind / v_wind in m/s (pixels_to_wind for compute_qa_flag's speed gate).
+                u_ms = sol["V_u"] * geom["dx_m"]
+                v_ms = sol["V_v"] * geom["dy_m"]
+                # Rich Level 0/1/2 QA from chi² / sigma_h / |∇h| / speed gates — same
+                # logic backfill_qa_local.py applies; doing it inline keeps future
+                # chunks self-consistent without needing a post-write backfill.
+                qa_sol = {
+                    "h": sol["h"], "chi2": sol["chi2"], "sigma_h": sol["sigma_h"],
+                    "u_wind": u_ms, "v_wind": v_ms,
+                }
+                qf = compute_qa_flag(qa_sol, vbbox).astype(np.float32)
+                qf[~vbbox] = 0.0
+                # px/s -> m/s with the bbox-cropped ground scale (reuse u_ms/v_ms).
+                rec = {
+                    "u_wind": u_ms, "v_wind": v_ms,
+                    "cloud_top_height": sol["h"], "quality_flag": qf,
+                    "chi_squared": sol["chi2"], "sigma_h": sol["sigma_h"],
+                    "sigma_u": sol["sigma_u"], "sigma_v": sol["sigma_v"],
+                }
             for b in flow_bands:
                 fb, ff = flows_band[b]
                 rec[flow_var("flow_back_u", b)] = fb[0]; rec[flow_var("flow_back_v", b)] = fb[1]

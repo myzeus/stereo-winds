@@ -27,7 +27,7 @@ import xarray as xr
 import xbatcher
 from torch.utils.data import Dataset
 
-from .student_dataset import (
+from .student_dataset import (  # noqa: E501  (import kept together)
     flow_var, rad_var, rad_tminus_var, rad_tplus_var, FLOW_STUBS, GEOM_VARS,
     DEFAULT_FLOW_BANDS, DEFAULT_RAD_BANDS,
     FLOW_SCALE, PIXEL_SCALE_NORM, ZENITH_NORM,
@@ -41,6 +41,80 @@ PATCH_SIZE = 256
 # check the returned key.
 _LABEL_VARS = ["u_wind", "v_wind", "cloud_top_height", "quality_flag"]
 _OPTIONAL_LABEL_VARS = ["chi_squared"]
+
+# Physics-aware dihedral augmentation (train-only). The winds (u, v) and the
+# input optical flows are VECTOR fields, so a geometric transform of the patch
+# must ALSO rotate/reflect the vectors — otherwise the (input, label) physics
+# is broken. `_VEC_M[op]` = (a, b, c, d): new_u = a*u + b*v, new_v = c*u + d*v.
+_DIHEDRAL_OPS = ["id", "hflip", "vflip", "rot180", "rot90", "rot270"]
+_VEC_M = {
+    "hflip":  (-1, 0, 0, 1),    # mirror x  → u→−u
+    "vflip":  (1, 0, 0, -1),    # mirror y  → v→−v
+    "rot180": (-1, 0, 0, -1),
+    "rot90":  (0, -1, 1, 0),    # CCW 90°   → (u,v)→(−v, u)
+    "rot270": (0, 1, -1, 0),    # CCW 270°  → (u,v)→(v, −u)
+}
+
+
+def _dihedral_spatial(a, op):
+    if op == "hflip":
+        return np.flip(a, -1)
+    if op == "vflip":
+        return np.flip(a, -2)
+    if op == "rot90":
+        return np.rot90(a, 1, axes=(-2, -1))
+    if op == "rot180":
+        return np.rot90(a, 2, axes=(-2, -1))
+    if op == "rot270":
+        return np.rot90(a, 3, axes=(-2, -1))
+    return a
+
+
+def _dihedral_vec(u, v, op):
+    a, b, c, d = _VEC_M[op]
+    return a * u + b * v, c * u + d * v
+
+
+def augment_dihedral(flow, rad, geom, u, v, h_km, mask, weight, chi2,
+                     n_flow_bands, rng, op=None):
+    """Apply one random dihedral op (D4: flips + 90/180/270 rotations) to a
+    sample, transforming vector fields correctly.
+
+    - Spatial transform applied to every array's last two dims (square patch).
+    - Flow channels are per band ``[back_u, back_v, fwd_u, fwd_v]``: the (u, v)
+      pairs are rotated by the op's vector matrix. Label winds (u, v) likewise.
+    - `geom` dx_m/dy_m (channels 0, 1) SWAP under 90°/270° rotation (the grid x
+      and y axes swap). Radiance/height/mask/weight/chi² are scalars → spatial
+      only.
+
+    Consistency (physics baseline of augmented flow == augmented wind) is
+    covered by ``tests/test_student_zeus.py::TestDihedralAug``.
+    """
+    op = op or _DIHEDRAL_OPS[int(rng.integers(len(_DIHEDRAL_OPS)))]
+    if op == "id":
+        return flow, rad, geom, u, v, h_km, mask, weight, chi2
+    ac = np.ascontiguousarray
+    flow = ac(_dihedral_spatial(flow, op))
+    rad = ac(_dihedral_spatial(rad, op))
+    geom = ac(_dihedral_spatial(geom, op))
+    h_km = ac(_dihedral_spatial(h_km, op))
+    mask = ac(_dihedral_spatial(mask, op))
+    weight = ac(_dihedral_spatial(weight, op))
+    u = ac(_dihedral_spatial(u, op))
+    v = ac(_dihedral_spatial(v, op))
+    if chi2 is not None:
+        chi2 = ac(_dihedral_spatial(chi2, op))
+    # Rotate the flow vectors (per band: (back_u,back_v) and (fwd_u,fwd_v)).
+    for bi in range(n_flow_bands):
+        for off in (0, 2):
+            cu, cv = bi * 4 + off, bi * 4 + off + 1
+            flow[cu], flow[cv] = _dihedral_vec(flow[cu], flow[cv], op)
+    # Rotate the label winds.
+    u, v = _dihedral_vec(u, v, op)
+    # dx_m/dy_m swap under 90°/270° rotation.
+    if op in ("rot90", "rot270"):
+        geom[[0, 1]] = geom[[1, 0]]
+    return flow, rad, geom, u, v, h_km, mask, weight, chi2
 
 
 class StudentXBatchDataset(Dataset):
@@ -91,8 +165,11 @@ class StudentXBatchDataset(Dataset):
         seed: int | None = None,
         rad_time_frames: int = 1,
         random_crop: bool = True,
+        aug_dihedral: bool = False,
     ):
         super().__init__()
+        # Train-only (val stays deterministic for a stable eval/rmsvd signal).
+        self.aug_dihedral = bool(aug_dihedral) and train
         if rad_time_frames not in (1, 3):
             raise ValueError(
                 f"rad_time_frames must be 1 (t₀ only) or 3 (t₋,t₀,t₊); "
@@ -134,6 +211,11 @@ class StudentXBatchDataset(Dataset):
             return int(v)
         ro = _scalar_int(feat.attrs.get("row_offset"), 0)
         co = _scalar_int(feat.attrs.get("col_offset"), 0)
+        # Multi-band: the combined store carries per-band labels u_wind_<b> etc.
+        # for each band in the `wind_bands` attr.  Absent → legacy single field.
+        wb = str(feat.attrs.get("wind_bands", ""))
+        self.wind_bands = [b for b in wb.split(",") if b]
+        self.n_bands = len(self.wind_bands) if self.wind_bands else 1
         fh, fw = int(feat.sizes["y"]), int(feat.sizes["x"])
         lab = feat if label_zarr is None else xr.open_zarr(str(label_zarr), chunks=None)
 
@@ -153,18 +235,23 @@ class StudentXBatchDataset(Dataset):
             lab = lab.isel(y=slice(ro, ro + fh), x=slice(co, co + fw))
         lab = lab.sel(time=times)
         ds = feat
-        for v in _LABEL_VARS:
-            if v not in ds:
-                ds = ds.assign({v: (("time", "y", "x"), lab[v].data)})
-        # chi_squared is OPTIONAL — graft only if the label store actually
-        # has it.  Lets older chunks still load.
-        self.has_chi2 = False
-        for v in _OPTIONAL_LABEL_VARS:
-            if v not in ds and v in lab:
-                ds = ds.assign({v: (("time", "y", "x"), lab[v].data)})
-                self.has_chi2 = self.has_chi2 or (v == "chi_squared")
-            elif v in ds:
-                self.has_chi2 = self.has_chi2 or (v == "chi_squared")
+        if self.n_bands > 1:
+            # Per-band labels live in the combined store already (u_wind_<b> …);
+            # no single-name grafting. chi² present iff the first band has it.
+            self.has_chi2 = f"chi_squared_{self.wind_bands[0]}" in ds
+        else:
+            for v in _LABEL_VARS:
+                if v not in ds:
+                    ds = ds.assign({v: (("time", "y", "x"), lab[v].data)})
+            # chi_squared is OPTIONAL — graft only if the label store actually
+            # has it.  Lets older chunks still load.
+            self.has_chi2 = False
+            for v in _OPTIONAL_LABEL_VARS:
+                if v not in ds and v in lab:
+                    ds = ds.assign({v: (("time", "y", "x"), lab[v].data)})
+                    self.has_chi2 = self.has_chi2 or (v == "chi_squared")
+                elif v in ds:
+                    self.has_chi2 = self.has_chi2 or (v == "chi_squared")
         # Load the overlap crop into RAM (numpy) so xbatcher tiles are pure
         # slicing — fast and fork-safe (dask-backed reads deadlock under forked
         # DataLoader workers). Fine at this scale; stream (preload=False) for
@@ -246,9 +333,18 @@ class StudentXBatchDataset(Dataset):
         def arr(name):
             return x[name].values.astype(np.float32)
 
-        u = arr("u_wind"); v = arr("v_wind")
-        h_km = arr("cloud_top_height") / 1000.0
-        qf = arr("quality_flag")
+        if self.n_bands > 1:
+            # Stack per-band labels onto a leading band axis → (nb, ps, ps).
+            def arr_b(v):
+                return np.stack([x[f"{v}_{b}"].values.astype(np.float32)
+                                 for b in self.wind_bands], 0)
+            u = arr_b("u_wind"); v = arr_b("v_wind")
+            h_km = arr_b("cloud_top_height") / 1000.0
+            qf = arr_b("quality_flag")
+        else:
+            u = arr("u_wind"); v = arr("v_wind")
+            h_km = arr("cloud_top_height") / 1000.0
+            qf = arr("quality_flag")
         mask = (qf >= self.qa_min) & np.isfinite(u) & np.isfinite(v) & np.isfinite(h_km)
         if mask.mean() < self.min_label_frac:
             return None
@@ -270,6 +366,20 @@ class StudentXBatchDataset(Dataset):
                          arr("dy_m") / PIXEL_SCALE_NORM,
                          arr("sat_zenith") / ZENITH_NORM], 0)
 
+        # chi² loaded BEFORE augmentation so the same op is applied to it.
+        # Clamp lower (non-negative) and upper (outliers > 1e6 blow up log()).
+        chi2 = None
+        if self.has_chi2:
+            raw_chi2 = arr_b("chi_squared") if self.n_bands > 1 else arr("chi_squared")
+            chi2 = np.clip(raw_chi2, 1e-6, 1e4).astype(np.float32)
+
+        # Train-only physics-aware dihedral augmentation (flips + rotations with
+        # matching u,v / flow vector transforms). Composes with random_crop.
+        if self.aug_dihedral:
+            flow, rad, geom, u, v, h_km, mask, weight, chi2 = augment_dihedral(
+                flow, rad, geom, u, v, h_km, mask, weight, chi2,
+                len(self.flow_bands), self.rng)
+
         nan = lambda a: np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
         sample = {
             "flow": torch.from_numpy(nan(flow)),
@@ -281,10 +391,6 @@ class StudentXBatchDataset(Dataset):
             "mask": torch.from_numpy(mask),
             "weight": torch.from_numpy(weight),
         }
-        if self.has_chi2:
-            # Clamp lower (chi² is non-negative) and upper (a few outliers
-            # have chi² > 1e6 that would blow up log).  Loss applies log()
-            # downstream, so clamp keeps gradients finite.
-            chi2 = np.clip(arr("chi_squared"), 1e-6, 1e4)
+        if chi2 is not None:
             sample["chi2"] = torch.from_numpy(nan(chi2))
         return sample

@@ -27,7 +27,7 @@ from zeus.models.base_lightning_module import BaseLightningModule
 from zeus.datasets.transform import StandardScalar
 
 from .student_model import PixelwiseWindStudent, UNetWindStudent
-from .student_module import heteroscedastic_nll, vector_nll
+from .student_module import heteroscedastic_nll, vector_nll, huber_uv
 from .student_dataset import FLOW_SCALE, PIXEL_SCALE_NORM
 
 logger = logging.getLogger(__name__)
@@ -66,6 +66,8 @@ class StudentWindsModel(BaseLightningModule):
         w_speed: float = 0.0,
         chi2_separate_head: bool = False,
         chi2_stop_grad: bool = False,
+        n_bands: int = 1,
+        per_band_loss: bool = True,
         **kwargs,
     ):
         # Radiance is standardized per band×frame by the zeus StandardScalar
@@ -88,10 +90,18 @@ class StudentWindsModel(BaseLightningModule):
         # wind_loss: "gaussian" → per-component NLL on z-scored u,v
         #            "vector"   → bivariate Gaussian NLL on (u,v) in PHYSICAL m/s
         #                         (data term equals squared RMSVD scaled by 1/2σ²)
+        #            "huber"    → robust Huber point loss on (u,v) in PHYSICAL
+        #                         m/s with NO variance hedging (matches the
+        #                         stereo teacher's fine-tuning; suppresses the
+        #                         regression-to-mean / jet under-prediction of
+        #                         the Gaussian NLL). Uses per-component logvar
+        #                         heads trained by a detached NLL purely so
+        #                         sigma_u/sigma_v stay meaningful — the mean is
+        #                         optimized by Huber alone.
         # logvar_init_offset shifts the model's joint logvar at init so the
         # initial variance estimate sits at a sane wind-error scale (~e^5 ≈ 150 m²/s² ⇒ σ ≈ 12 m/s).
-        if wind_loss not in ("gaussian", "vector"):
-            raise ValueError(f"wind_loss must be 'gaussian' or 'vector', got {wind_loss!r}")
+        if wind_loss not in ("gaussian", "vector", "huber"):
+            raise ValueError(f"wind_loss must be 'gaussian', 'vector' or 'huber', got {wind_loss!r}")
         self.wind_loss = wind_loss
         self.logvar_init_offset = logvar_init_offset
         # Optional teacher-chi² distillation: an extra head channel predicts
@@ -113,6 +123,21 @@ class StudentWindsModel(BaseLightningModule):
         # toward zero).  Weighted MSE between |V_pred| and |V_teacher|.
         self.w_speed = float(w_speed)
 
+        # n_bands: 1 = single fused wind field (legacy). >1 = predict a wind
+        # field per flow band (each with its own physics baseline + height +
+        # chi²); must equal n_flow_bands so each output band maps to one flow
+        # band's parallax-free baseline.
+        if n_bands not in (1, n_flow_bands):
+            raise ValueError(
+                f"n_bands must be 1 or n_flow_bands ({n_flow_bands}), got {n_bands}")
+        self.n_bands = n_bands
+        # Per-band loss averaging (multi-band only): compute each band's masked
+        # loss separately and average across bands, so every band contributes
+        # equally regardless of its valid-pixel count. Without this, the pooled
+        # masked-mean weights bands by pixel count and STARVES sparse bands
+        # (e.g. C08, few high clouds) — the observed C08 regression.
+        self.per_band_loss = bool(per_band_loss)
+
         in_channels = 4 * n_flow_bands + n_rad_channels + 3
         self.rad_time_frames = rad_time_frames
         wlm = "joint" if wind_loss == "vector" else "per_component"
@@ -123,6 +148,7 @@ class StudentWindsModel(BaseLightningModule):
                 predict_chi2=self.predict_chi2,
                 chi2_separate_head=chi2_separate_head,
                 chi2_stop_grad=chi2_stop_grad,
+                n_bands=n_bands,
             )
         elif trunk == "unet":
             self.net = UNetWindStudent(
@@ -133,6 +159,7 @@ class StudentWindsModel(BaseLightningModule):
                 predict_chi2=self.predict_chi2,
                 chi2_separate_head=chi2_separate_head,
                 chi2_stop_grad=chi2_stop_grad,
+                n_bands=n_bands,
             )
         else:
             raise ValueError(f"trunk must be 'pixelwise' or 'unet', got {trunk!r}")
@@ -164,7 +191,12 @@ class StudentWindsModel(BaseLightningModule):
         dy_m = geom[:, 1:2] * PIXEL_SCALE_NORM
         u_band = (fwd_u - back_u) * dx_m / (2.0 * DT_SEC)  # m/s, (B, n_flow, H, W)
         v_band = (fwd_v - back_v) * dy_m / (2.0 * DT_SEC)
-        return u_band.mean(dim=1), v_band.mean(dim=1)     # (B, H, W) each
+        if self.n_bands == 1:
+            # Single fused field: average the per-band parallax-free winds.
+            return u_band.mean(dim=1), v_band.mean(dim=1)  # (B, H, W) each
+        # Multi-band: each output band gets its OWN flow band's baseline, so the
+        # network only learns the per-band residual (n_bands == n_flow_bands).
+        return u_band, v_band                              # (B, n_bands, H, W) each
 
     def forward(self, flow, rad, geom):
         # Physics baseline for u/v in m/s, computed from the raw inputs.
@@ -262,16 +294,35 @@ class StudentWindsModel(BaseLightningModule):
     def step(self, batch, batch_idx):
         out = self(batch["flow"], batch["rad"], batch["geom"])
         mask, w = batch["mask"], batch["weight"]
+        # Multi-band: labels/mask carry a band axis (B, nb, H, W). If the loader
+        # supplies a per-pixel (B, H, W) weight, broadcast it across the bands so
+        # the masked-loss reductions (which flatten and thus sum over bands) see
+        # a matching shape.
+        if w.dim() == mask.dim() - 1:
+            w = w.unsqueeze(1).expand_as(mask)
         bs = batch["u"].shape[0]
         mu, sd = self.target_mu, self.target_sd
         m = self.mode or "train"
 
+        # Per-band loss averaging: each band's masked loss computed separately
+        # and averaged (equal weight per band), so sparse bands aren't starved.
+        do_pb = self.n_bands > 1 and self.per_band_loss
+
+        def pb(fn):
+            """Average a per-band masked loss over the band axis (dim=1)."""
+            return torch.stack([fn(b) for b in range(self.n_bands)]).mean()
+
         # Height: always heteroscedastic Gaussian/Huber in z-space.
         h_n = (batch["h_km"] - mu[2]) / sd[2]
-        nll_h = heteroscedastic_nll(
-            h_n, out["h_mean"], out["h_logvar"], mask, w,
-            self.nll_mode, self.huber_delta,
-        )
+        if do_pb:
+            nll_h = pb(lambda b: heteroscedastic_nll(
+                h_n[:, b], out["h_mean"][:, b], out["h_logvar"][:, b],
+                mask[:, b], w[:, b], self.nll_mode, self.huber_delta))
+        else:
+            nll_h = heteroscedastic_nll(
+                h_n, out["h_mean"], out["h_logvar"], mask, w,
+                self.nll_mode, self.huber_delta,
+            )
 
         if self.wind_loss == "vector":
             # Compute wind residual in PHYSICAL m/s so the data term is RMSVD-aligned.
@@ -287,6 +338,42 @@ class StudentWindsModel(BaseLightningModule):
             self.log(f"{m}/loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
             self.log(f"{m}/nll_wind", nll_wind, batch_size=bs)
             self.log(f"{m}/nll_h", nll_h, batch_size=bs)
+        elif self.wind_loss == "huber":
+            # Robust Huber point loss on the wind vector in PHYSICAL m/s — no
+            # variance hedging, so the mean is not pulled toward the conditional
+            # mean (fixes jet under-prediction).  Weighted by (w_u + w_v)/2 to
+            # keep the wind-side budget comparable to the other modes.
+            u_p = out["u_mean"] * sd[0] + mu[0]
+            v_p = out["v_mean"] * sd[1] + mu[1]
+            # Uncertainty heads: train u_logvar/v_logvar to match the residual
+            # with the mean DETACHED, so sigma_u/sigma_v stay calibrated for the
+            # output schema without letting the variance hedge (and thus bias)
+            # the mean.  z-scored, matching the per-component logvar convention.
+            u_n = (batch["u"] - mu[0]) / sd[0]
+            v_n = (batch["v"] - mu[1]) / sd[1]
+            if do_pb:
+                huber_wind = pb(lambda b: huber_uv(
+                    batch["u"][:, b], batch["v"][:, b], u_p[:, b], v_p[:, b],
+                    mask[:, b], w[:, b], self.huber_delta))
+                nll_u_unc = pb(lambda b: heteroscedastic_nll(
+                    u_n[:, b], out["u_mean"][:, b].detach(), out["u_logvar"][:, b],
+                    mask[:, b], w[:, b], "gaussian"))
+                nll_v_unc = pb(lambda b: heteroscedastic_nll(
+                    v_n[:, b], out["v_mean"][:, b].detach(), out["v_logvar"][:, b],
+                    mask[:, b], w[:, b], "gaussian"))
+            else:
+                huber_wind = huber_uv(
+                    batch["u"], batch["v"], u_p, v_p, mask, w, self.huber_delta)
+                nll_u_unc = heteroscedastic_nll(
+                    u_n, out["u_mean"].detach(), out["u_logvar"], mask, w, "gaussian")
+                nll_v_unc = heteroscedastic_nll(
+                    v_n, out["v_mean"].detach(), out["v_logvar"], mask, w, "gaussian")
+            loss = (0.5 * (self.w_u + self.w_v) * huber_wind + self.w_h * nll_h
+                    + 0.5 * (nll_u_unc + nll_v_unc))
+            self.log(f"{m}/loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=bs)
+            self.log(f"{m}/huber_wind", huber_wind, batch_size=bs)
+            self.log(f"{m}/nll_h", nll_h, batch_size=bs)
+            self.log(f"{m}/nll_uv_unc", 0.5 * (nll_u_unc + nll_v_unc), batch_size=bs)
         else:
             # Per-component Gaussian / huber on z-scored targets.
             u_n = (batch["u"] - mu[0]) / sd[0]
