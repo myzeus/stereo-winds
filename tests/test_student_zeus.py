@@ -6,7 +6,7 @@ import torch
 import xarray as xr
 from torch.utils.data import DataLoader
 
-from stereo_winds.student_xbatcher import StudentXBatchDataset
+from stereo_winds.student_xbatcher import StudentXBatchDataset, augment_dihedral
 from stereo_winds.student_zeus_model import StudentWindsModel
 from stereo_winds.student_dataset import (
     flow_var, rad_var, rad_tminus_var, rad_tplus_var, FLOW_STUBS, GEOM_VARS,
@@ -89,6 +89,123 @@ def _build_3t(tmp_path):
     }
     xr.Dataset(lv, coords={"time": times}).to_zarr(lab_p, mode="w")
     return str(feat_p), str(lab_p)
+
+
+def _build_mb(tmp_path):
+    """Combined store (label_zarr=None) with 3-frame rad + PER-BAND labels
+    u_wind_<b>/…/chi_squared_<b> for each flow band, and a wind_bands attr."""
+    p = tmp_path / "mb.zarr"
+    times = np.array([np.datetime64("2026-01-01T00:00") + np.timedelta64(10 * i, "m")
+                      for i in range(N_TIMES)])
+    rng = np.random.default_rng(0)
+    fv = {}
+    for b in FLOW_BANDS:
+        for s in FLOW_STUBS:
+            fv[flow_var(s, b)] = (("time", "y", "x"),
+                                  rng.normal(0, 3, (N_TIMES, FH, FW)).astype("f4"))
+    for b in RAD_BANDS:
+        for stub in (rad_var, rad_tminus_var, rad_tplus_var):
+            fv[stub(b)] = (("time", "y", "x"),
+                           rng.normal(250, 20, (N_TIMES, FH, FW)).astype("f4"))
+    for v in GEOM_VARS:
+        fv[v] = (("y", "x"), np.full((FH, FW), 2000.0, "f4"))
+    # Per-band labels (combined store, on the feature grid — no crop).
+    for b in FLOW_BANDS:
+        fv[f"u_wind_{b}"] = (("time", "y", "x"), rng.normal(0, 15, (N_TIMES, FH, FW)).astype("f4"))
+        fv[f"v_wind_{b}"] = (("time", "y", "x"), rng.normal(0, 15, (N_TIMES, FH, FW)).astype("f4"))
+        fv[f"cloud_top_height_{b}"] = (("time", "y", "x"), rng.uniform(0, 12000, (N_TIMES, FH, FW)).astype("f4"))
+        fv[f"quality_flag_{b}"] = (("time", "y", "x"), np.full((N_TIMES, FH, FW), 2.0, "f4"))
+        fv[f"chi_squared_{b}"] = (("time", "y", "x"), rng.uniform(0.05, 0.8, (N_TIMES, FH, FW)).astype("f4"))
+        fv[f"sigma_h_{b}"] = (("time", "y", "x"), rng.uniform(50, 800, (N_TIMES, FH, FW)).astype("f4"))
+    ds = xr.Dataset(fv, coords={"time": times})
+    ds.attrs.update(row_offset=ROW_OFF, col_offset=COL_OFF, rad_time_frames=3,
+                    wind_bands=",".join(FLOW_BANDS))
+    ds.to_zarr(p, mode="w")
+    return str(p)
+
+
+class TestMultiBand:
+    """Per-band (multi-band) student: loader band axis + a training step."""
+
+    def _ds(self, tmp_path):
+        return StudentXBatchDataset(
+            feature_zarr=_build_mb(tmp_path), label_zarr=None,
+            flow_bands=FLOW_BANDS, rad_bands=RAD_BANDS, rad_time_frames=3,
+            patch_size=16, seed=0)
+
+    def test_loader_stacks_band_axis(self, tmp_path):
+        ds = self._ds(tmp_path)
+        assert ds.n_bands == len(FLOW_BANDS)
+        s = ds[0]
+        nb = len(FLOW_BANDS)
+        for k in ("u", "v", "h_km", "weight", "chi2"):
+            assert s[k].shape == (nb, 16, 16), (k, s[k].shape)
+        assert s["mask"].shape == (nb, 16, 16) and s["mask"].dtype == torch.bool
+        # inputs stay single (shared across bands)
+        assert s["flow"].shape == (4 * len(FLOW_BANDS), 16, 16)
+
+    def test_two_step_fit_multiband(self, tmp_path):
+        import pytorch_lightning as pl
+        from torch.utils.data import DataLoader
+        ds = self._ds(tmp_path)
+        loader = DataLoader(ds, batch_size=4, num_workers=0)
+        nb = len(FLOW_BANDS)
+        model = StudentWindsModel(
+            n_flow_bands=len(FLOW_BANDS), n_rad_bands=len(RAD_BANDS),
+            hidden=16, n_layers=2, wind_loss="huber", huber_delta=10.0,
+            rad_time_frames=3, predict_chi2=True, chi2_separate_head=True,
+            n_bands=nb)
+        model.prepare_data_transformation(loader, n_batches=2)
+        trainer = pl.Trainer(accelerator="cpu", max_steps=2, logger=False,
+                             enable_checkpointing=False, enable_progress_bar=False)
+        trainer.fit(model, loader)
+        assert trainer.global_step == 2
+        # predict emits per-band winds + chi²
+        b = next(iter(loader))
+        out = model.predict(b["flow"], b["rad"], b["geom"])
+        assert out["u_mean"].shape[1] == nb and out["chi2"].shape[1] == nb
+
+
+class TestDihedralAug:
+    """Physics-aware dihedral aug: baseline(flow_aug) must equal vec(baseline(flow))."""
+
+    def test_flow_baseline_consistency(self):
+        rng = np.random.default_rng(0)
+        NF = len(FLOW_BANDS)
+        H = W = 12
+        model = StudentWindsModel(n_flow_bands=NF, n_rad_bands=len(RAD_BANDS),
+                                  hidden=8, n_layers=1, rad_time_frames=1)
+        flow = rng.normal(0, 1, (4 * NF, H, W)).astype("f4")
+        # distinct, non-uniform dx/dy so the rot90/270 dx<->dy swap is exercised
+        dx = np.linspace(1, 2, H * W).reshape(H, W).astype("f4")
+        dy = np.linspace(3, 4, H * W).reshape(H, W).astype("f4")
+        geom = np.stack([dx, dy, np.full((H, W), 0.5, "f4")], 0)
+        rad = rng.normal(0, 1, (len(RAD_BANDS), H, W)).astype("f4")
+        z = np.zeros((H, W), "f4")
+
+        def baseline(f, g):
+            ub, vb = model._physics_baseline(
+                torch.from_numpy(f)[None], torch.from_numpy(g)[None])
+            return ub[0].numpy(), vb[0].numpy()
+
+        u0, v0 = baseline(flow, geom)
+        for op in ["hflip", "vflip", "rot90", "rot180", "rot270"]:
+            fa, _, ga, ua, va, *_ = augment_dihedral(
+                flow.copy(), rad.copy(), geom.copy(), u0.copy(), v0.copy(),
+                z.copy(), z.copy(), z.copy(), None, NF, rng, op=op)
+            uba, vba = baseline(fa, ga)
+            assert np.allclose(uba, ua, atol=1e-3), (op, "u", float(np.abs(uba - ua).max()))
+            assert np.allclose(vba, va, atol=1e-3), (op, "v", float(np.abs(vba - va).max()))
+
+    def test_dataset_aug_preserves_shapes(self, tmp_path):
+        ds = StudentXBatchDataset(
+            feature_zarr=_build_mb(tmp_path), label_zarr=None,
+            flow_bands=FLOW_BANDS, rad_bands=RAD_BANDS, rad_time_frames=3,
+            patch_size=16, seed=0, aug_dihedral=True)
+        assert ds.aug_dihedral is True
+        s = ds[0]
+        nb = len(FLOW_BANDS)
+        assert s["u"].shape == (nb, 16, 16) and s["flow"].shape == (4 * nb, 16, 16)
 
 
 class TestStudentXBatch:
@@ -569,6 +686,56 @@ class TestVectorWindLoss:
         )
         assert m_vec.net.n_out == 5
         assert m_gauss.net.n_out == 6
+
+
+class TestHuberWindLoss:
+    """Huber wind-loss path: per-component heads, chi² preserved, two-step fit."""
+
+    def _model(self, **kw):
+        return StudentWindsModel(
+            n_flow_bands=len(FLOW_BANDS), n_rad_bands=len(RAD_BANDS),
+            hidden=16, n_layers=2, wind_loss="huber", huber_delta=10.0, **kw,
+        )
+
+    def test_forward_returns_per_component_logvar(self, tmp_path):
+        ds = _ds(tmp_path)
+        loader = DataLoader(ds, batch_size=4, num_workers=0)
+        model = self._model()
+        model.prepare_data_transformation(loader, n_batches=2)
+        batch = next(iter(loader))
+        out = model(batch["flow"], batch["rad"], batch["geom"])
+        # Huber uses per-component heads (kept only to surface sigma_u/sigma_v).
+        assert "u_logvar" in out and "v_logvar" in out
+        assert "uv_logvar" not in out
+
+    def test_predict_surfaces_sigma_and_chi2(self, tmp_path):
+        ds = _ds(tmp_path)
+        loader = DataLoader(ds, batch_size=4, num_workers=0)
+        model = self._model(predict_chi2=True)
+        model.prepare_data_transformation(loader, n_batches=2)
+        batch = next(iter(loader))
+        out = model.predict(batch["flow"], batch["rad"], batch["geom"])
+        for k in ("u_mean", "v_mean", "h_mean", "u_logvar", "v_logvar", "h_logvar"):
+            assert k in out
+        # chi² must still be emitted under the huber loss (key requirement).
+        assert "chi2" in out
+        assert out["chi2"].shape == batch["u"].shape
+        assert (out["chi2"] > 0).all()
+
+    def test_head_channel_count_with_chi2(self, tmp_path):
+        """Huber → per-component 6-channel head, +1 for chi² = 7."""
+        assert self._model().net.n_out == 6
+        assert self._model(predict_chi2=True).net.n_out == 7
+
+    def test_two_step_fit_huber(self, tmp_path):
+        import pytorch_lightning as pl
+        ds = _ds(tmp_path)
+        loader = DataLoader(ds, batch_size=4, num_workers=0)
+        model = self._model(predict_chi2=True)
+        trainer = pl.Trainer(accelerator="cpu", max_steps=2, logger=False,
+                             enable_checkpointing=False, enable_progress_bar=False)
+        trainer.fit(model, loader)
+        assert trainer.global_step == 2
 
 
 class TestUNetTrunk:

@@ -100,6 +100,44 @@ def vector_nll(
     return (w * nll_m).sum() / w.sum().clamp(min=1.0)
 
 
+def huber_uv(
+    target_u: torch.Tensor,
+    target_v: torch.Tensor,
+    mean_u: torch.Tensor,
+    mean_v: torch.Tensor,
+    mask: torch.Tensor,
+    weight: torch.Tensor | None = None,
+    delta: float = 10.0,
+) -> torch.Tensor:
+    """Masked, weighted Huber (smooth-L1) loss on the wind vector (u, v).
+
+    A robust *point* loss with NO learned variance term.  Unlike
+    ``vector_nll`` / ``heteroscedastic_nll`` there is no ``exp(-logvar)``
+    weighting, so the model cannot lower the loss by predicting near the
+    conditional mean and inflating its uncertainty.  Removing that
+    variance-hedging escape hatch is what suppresses the regression-to-mean
+    (jet under-prediction) seen with the heteroscedastic NLL, and mirrors the
+    Huber objective used to fine-tune the stereo teacher.
+
+    ``delta`` is in the same (physical) units as the inputs — m/s.  Keep it
+    LARGE (~10-15): Huber goes linear beyond ``delta``, so a small delta
+    down-weights large residuals and treats jets as outliers, which *worsens*
+    their under-prediction.  A large delta stays quadratic (L2-like) across
+    the real wind range and only softens genuine outliers / noisy teacher
+    labels.
+
+    Returns a scalar.  Empty mask returns 0 connected to the graph.
+    """
+    if not mask.any():
+        return mean_u.sum() * 0.0
+    hb = _huber(target_u - mean_u, delta) + _huber(target_v - mean_v, delta)
+    hb_m = hb[mask]
+    if weight is None:
+        return hb_m.mean()
+    w = weight[mask]
+    return (w * hb_m).sum() / w.sum().clamp(min=1.0)
+
+
 class StudentWindsModule(LightningModule):
     """Train ``PixelwiseWindStudent`` against stereo teacher labels."""
 

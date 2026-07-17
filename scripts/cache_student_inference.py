@@ -112,6 +112,9 @@ def main():
     ap.add_argument("--flow-bands", default=",".join(DEFAULT_FLOW_BANDS))
     ap.add_argument("--rad-bands", default=",".join(DEFAULT_RAD_BANDS))
     ap.add_argument("--row-strip", type=int, default=1024)
+    ap.add_argument("--eval-band", default="C14",
+                    help="For a multi-band model, which flow band's winds to "
+                         "write (single-band models ignore this).")
     ap.add_argument("--out-zarr", required=True)
     ap.add_argument("--max-scenes", type=int, default=-1,
                     help="If >0, cap the number of scenes (debug).")
@@ -126,6 +129,12 @@ def main():
     model = load_student(args.ckpt)
     print(f"  target mu  : {model.target_mu.detach().cpu().numpy()}  (u m/s, v m/s, h km)")
     print(f"  target sd  : {model.target_sd.detach().cpu().numpy()}")
+    # Multi-band model: select which band's winds to write (band order == flow_bands).
+    band_idx = None
+    if int(getattr(model, "n_bands", 1)) > 1:
+        band_idx = flow_bands.index(args.eval_band)
+        print(f"  multi-band model (n_bands={model.n_bands}); writing band "
+              f"{args.eval_band} (idx {band_idx})", flush=True)
 
     eval_times_arr = collect_eval_times(args.teacher_zarr, args.max_scenes)
     n_scenes = len(eval_times_arr)
@@ -171,7 +180,7 @@ def main():
             print(f"[{k+1}/{len(todo)}] (slot {int(i)}) {t0}", flush=True)
             arrs = infer_one_time(
                 model, disp, cubes, sat, t0, flow_bands, rad_bands,
-                row_strip=args.row_strip,
+                row_strip=args.row_strip, band_idx=band_idx,
             )
         except Exception as e:
             print(f"  skip slot {int(i)} ({t0}): {type(e).__name__}: {e}", flush=True)

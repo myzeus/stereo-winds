@@ -151,8 +151,13 @@ def _forward_full_disk(
     model: StudentWindsModel,
     flow_arr: np.ndarray, rad_arr: np.ndarray, geom_arr: np.ndarray,
     row_strip: int = 1024, halo: int = 8, device: str = "cuda",
+    band_idx: int | None = None,
 ) -> dict[str, np.ndarray]:
-    """Forward in row-strips; returns (H, W) arrays in physical units."""
+    """Forward in row-strips; returns (H, W) arrays in physical units.
+
+    For a multi-band model ``predict`` returns per-band ``(B, nb, H, W)``;
+    ``band_idx`` selects one band so the rest of the pipeline stays single-band.
+    """
     H, W = flow_arr.shape[1], flow_arr.shape[2]
     keys = ["u_mean", "v_mean", "h_mean", "u_logvar", "v_logvar", "h_logvar"]
     # If the trained model has a chi² head, surface it too.
@@ -168,6 +173,9 @@ def _forward_full_disk(
             rt = torch.from_numpy(rad_arr[:, r0_in:r1_in]).unsqueeze(0).to(device)
             gt = torch.from_numpy(geom_arr[:, r0_in:r1_in]).unsqueeze(0).to(device)
             o = model.predict(ft, rt, gt)
+            # Multi-band: predict returns (B, nb, H, W) per key — pick one band.
+            if band_idx is not None:
+                o = {k: (v[:, band_idx] if v.ndim == 4 else v) for k, v in o.items()}
             keep0 = r - r0_in
             keep1 = keep0 + (r1_keep - r)
             for k in keys:
@@ -185,8 +193,11 @@ def infer_one_time(
     row_strip: int = 1024,
     halo: int = 8,
     device: str = "cuda",
+    band_idx: int | None = None,
 ) -> dict[str, np.ndarray]:
     """Full-disk student inference at one time.
+
+    ``band_idx`` selects one output band for a multi-band model (else None).
 
     Returns a dict with the stereo-cache variable schema:
     ``u_wind``, ``v_wind`` (m/s), ``cloud_top_height`` (m),
@@ -200,7 +211,8 @@ def infer_one_time(
         rad_time_frames=rad_time_frames,
     )
     raw = _forward_full_disk(model, flow_arr, rad_arr, geom_arr,
-                             row_strip=row_strip, halo=halo, device=device)
+                             row_strip=row_strip, halo=halo, device=device,
+                             band_idx=band_idx)
     u = np.where(finite_mask, raw["u_mean"], np.nan)
     v = np.where(finite_mask, raw["v_mean"], np.nan)
     h_km = np.where(finite_mask, raw["h_mean"], np.nan)

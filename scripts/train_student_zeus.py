@@ -59,11 +59,21 @@ def main():
     p.add_argument("--nll-mode", choices=["gaussian", "huber_learned"], default="gaussian",
                    help="Per-component NLL mode for the gaussian wind-loss path "
                         "and for the height loss in all modes.")
-    p.add_argument("--wind-loss", choices=["gaussian", "vector"], default="vector",
+    p.add_argument("--wind-loss", choices=["gaussian", "vector", "huber"], default="vector",
                    help="'gaussian': per-component NLL on z-scored u, v "
                         "(legacy).  'vector': bivariate Gaussian NLL on (u,v) "
                         "in physical m/s — data term is RMSVD-aligned and the "
-                        "model emits a single joint wind logvar per pixel.")
+                        "model emits a single joint wind logvar per pixel.  "
+                        "'huber': robust Huber point loss on (u,v) in physical "
+                        "m/s with no variance hedging — matches the stereo "
+                        "teacher's fine-tuning and suppresses regression-to-mean "
+                        "(jet under-prediction). See --huber-delta.")
+    p.add_argument("--huber-delta", type=float, default=10.0,
+                   help="Huber transition point in m/s for --wind-loss huber "
+                        "(and the huber_learned nll-mode). Keep large (~10-15) "
+                        "so genuine winds stay in the quadratic region and only "
+                        "outliers are down-weighted; small deltas treat jets as "
+                        "outliers and worsen their under-prediction.")
     p.add_argument("--logvar-init-offset", type=float, default=5.0,
                    help="(vector mode) offset added to the model's joint "
                         "logvar at training time so the initial wind-error "
@@ -94,6 +104,28 @@ def main():
     p.add_argument("--transform-batches", type=int, default=50,
                    help="#train batches to fit the radiance StandardScalar")
     p.add_argument("--accelerator", default="gpu")
+    p.add_argument("--n-bands", type=int, default=1,
+                   help="1 = single fused wind field (legacy). >1 = multi-band "
+                        "student predicting a wind field per flow band (must equal "
+                        "len(--flow-bands)); needs a dataset built with "
+                        "cache_student_dataset --per-band-labels.")
+    p.add_argument("--per-band-loss", dest="per_band_loss",
+                   action=argparse.BooleanOptionalAction, default=True,
+                   help="Multi-band only: average each band's masked loss equally "
+                        "(vs pooling all band-pixels, which starves sparse bands "
+                        "like C08). Default on.")
+    p.add_argument("--aug-dihedral", dest="aug_dihedral",
+                   action=argparse.BooleanOptionalAction, default=False,
+                   help="Train-only physics-aware dihedral augmentation (flips + "
+                        "90/180/270 rotations with matching u,v / flow vector "
+                        "transforms). Composes with --random-crop; ~4-8x effective "
+                        "data. Default off.")
+    p.add_argument("--devices", type=int, default=1,
+                   help="GPUs per node (use 1 on grace GH200 nodes).")
+    p.add_argument("--num-nodes", type=int, default=1,
+                   help="Number of nodes for multi-node DDP.")
+    p.add_argument("--strategy", default="auto",
+                   help="Lightning strategy; use 'ddp' for multi-GPU/multi-node.")
     p.add_argument("--output-dir", default=str(BASE / "output" / "student_zeus"))
     p.add_argument("--wandb-project", default="stereo-winds-student")
     p.add_argument("--run-name", default="student-zeus")
@@ -148,6 +180,14 @@ def main():
                         "predict log(teacher_chi²) from those features. "
                         "Targets the chi²-vs-wind capacity competition "
                         "we measured (~2.5 m/s apples-to-apples cost).")
+    p.add_argument("--limit-val-batches", type=int, default=0,
+                   help="Cap validation to this many batches per epoch (0 = all). "
+                        "The full deterministic val tiling is ~thousands of batches "
+                        "(~hours); a few hundred give a stable eval/rmsvd far faster.")
+    p.add_argument("--val-check-interval", type=int, default=0,
+                   help="Run validation every N training batches (0 = once per "
+                        "epoch). With large datasets (long epochs) this gives "
+                        "eval/rmsvd + best-ckpt + early-stop feedback mid-epoch.")
     p.add_argument("--early-stop-patience", type=int, default=5,
                    help="Stop training if eval/rmsvd doesn't improve for N "
                         "consecutive evals (only active when --val-months is "
@@ -175,6 +215,7 @@ def main():
         rad_time_frames=args.rad_time_frames,
         val_months=val_months_list,
         random_crop=args.random_crop,
+        aug_dihedral=args.aug_dihedral,
     )
 
     def _build(train):
@@ -208,6 +249,8 @@ def main():
         n_flow_bands=len(flow_bands), n_rad_bands=len(rad_bands),
         hidden=args.hidden, n_layers=args.n_layers, context=not args.no_context,
         w_u=args.w_u, w_v=args.w_v, w_h=args.w_h, nll_mode=args.nll_mode,
+        huber_delta=args.huber_delta, n_bands=args.n_bands,
+        per_band_loss=args.per_band_loss,
         wind_loss=args.wind_loss, logvar_init_offset=args.logvar_init_offset,
         trunk=args.trunk, unet_base_channels=args.unet_base_channels,
         unet_n_levels=args.unet_n_levels,
@@ -226,7 +269,19 @@ def main():
         print(f"warm-start: loading weights from {args.init_ckpt}")
         ck = torch.load(args.init_ckpt, map_location="cpu", weights_only=False)
         sd = ck.get("state_dict", ck)
+        # strict=False ignores missing/unexpected keys, but a key present in
+        # BOTH with a different shape still raises (e.g. the output head when
+        # warm-starting across wind-loss modes: vector's joint 5-ch head vs
+        # huber's per-component 6-ch head). Drop those so the matching trunk
+        # transfers and only the incompatible head is left at init.
+        model_sd = model.state_dict()
+        shape_skipped = [k for k, v in sd.items()
+                         if k in model_sd and v.shape != model_sd[k].shape]
+        for k in shape_skipped:
+            del sd[k]
         missing, unexpected = model.load_state_dict(sd, strict=False)
+        if shape_skipped:
+            print(f"  shape-mismatched keys (left at init): {shape_skipped}")
         if missing:
             print(f"  missing keys (left at init): {missing[:8]}{'...' if len(missing) > 8 else ''}")
         if unexpected:
@@ -266,16 +321,22 @@ def main():
             monitor="eval/rmsvd", mode="min",
             filename="best-val-{step:06d}",
         ))
-        callbacks.append(EarlyStopping(
-            monitor="eval/rmsvd", mode="min",
-            patience=args.early_stop_patience, verbose=True,
-        ))
-        print(f"  callbacks: best-val ckpt + EarlyStopping (patience="
-              f"{args.early_stop_patience}) on eval/rmsvd")
+        if args.early_stop_patience > 0:
+            callbacks.append(EarlyStopping(
+                monitor="eval/rmsvd", mode="min",
+                patience=args.early_stop_patience, verbose=True,
+            ))
+            print(f"  callbacks: best-val ckpt + EarlyStopping (patience="
+                  f"{args.early_stop_patience}) on eval/rmsvd")
+        else:
+            print("  callbacks: best-val ckpt (EarlyStopping DISABLED: patience<=0)")
     trainer = pl.Trainer(
         max_epochs=args.max_epochs, max_steps=args.max_steps,
-        accelerator=args.accelerator, devices=1, precision="32-true",
+        accelerator=args.accelerator, devices=args.devices,
+        num_nodes=args.num_nodes, strategy=args.strategy, precision="32-true",
         gradient_clip_val=1.0, log_every_n_steps=10,
+        limit_val_batches=(args.limit_val_batches if args.limit_val_batches > 0 else 1.0),
+        val_check_interval=(args.val_check_interval if args.val_check_interval > 0 else 1.0),
         callbacks=callbacks, logger=loggers, default_root_dir=args.output_dir,
     )
     trainer.fit(model, train_loader, val_loader,
