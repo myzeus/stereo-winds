@@ -238,9 +238,9 @@ def main():
                              np.hypot(uhs, vhs), np.hypot(urs, vrs)])
     lim_s = np.ceil((float(np.nanmax(sp_all)) + 1e-6) / 5) * 5
 
-    fig = plt.figure(figsize=(12.5, 12.0))
+    fig = plt.figure(figsize=(12.5, 11.6))
     gs = GridSpec(3, 3, figure=fig, height_ratios=[1, 1, 0.85],
-                  hspace=0.30, wspace=0.28, left=0.08, right=0.90, top=0.92, bottom=0.07)
+                  hspace=0.30, wspace=0.28, left=0.07, right=0.91, top=0.945, bottom=0.055)
     rows = [("Teacher — cross-satellite stereo", uht, vht, urt, vrt),
             ("Student — single-satellite", uhs, vhs, urs, vrs)]
     col_specs = [("u", "$u$", -lim_u, lim_u, False),
@@ -302,12 +302,11 @@ def main():
                  transform=axb.transAxes, va="top", fontsize=8, color="0.4")
 
     fig.suptitle(
-        f"Single-satellite student vs cross-satellite teacher, vs held-out IGRA radiosondes  ·  "
-        f"aggregate RMSVD  teacher {rv_t_all:.2f}  /  student {rv_s_all:.2f} m s$^{{-1}}$  "
-        f"($\\chi^2\\!\\leq\\!{args.chi2_max:g}$,  N={len(merged):,})",
-        fontsize=12.5, fontweight="bold", y=0.975)
+        f"Retrieved winds vs held-out radiosondes  ·  RMSVD {rv_t_all:.2f} / "
+        f"{rv_s_all:.2f} m s$^{{-1}}$  ($\\chi^2\\!\\leq\\!{args.chi2_max:g}$, N={len(merged):,})",
+        fontsize=12, fontweight="bold", y=0.99)
     for ext in ("png", "pdf"):
-        fig.savefig(str(Path(args.out).with_suffix(f".{ext}")), dpi=300)
+        fig.savefig(str(Path(args.out).with_suffix(f".{ext}")), dpi=300, bbox_inches="tight")
         print(f"=== wrote {Path(args.out).with_suffix('.' + ext)}")
 
 
