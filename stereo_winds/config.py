@@ -85,12 +85,54 @@ HIMAWARI9_CONFIG = SatelliteConfig(
     n_cols=5500,
 )
 
+# MTG-I1 FCI, FDHSI 2 km full-disk grid (5568², extent ±5568 km at
+# perspective height 35786400 m -> 2000/35786400 rad/px). Fallbacks only —
+# data_loading derives the exact values from the file's projection metadata.
+MTG_I1_CONFIG = SatelliteConfig(
+    satellite_id="mtg-i1",
+    sub_lon_deg=0.0,
+    satellite_height_m=35786400.0,
+    sweep="y",  # Meteosat convention (only GOES ABI uses x-sweep)
+    scale_x=5.58871e-05,
+    scale_y=-5.58871e-05,
+    x_offset=-0.155562,
+    y_offset=0.155562,
+    n_rows=5568,
+    n_cols=5568,
+)
+
 SATELLITE_CONFIGS = {
     "goes16": GOES16_CONFIG,
     "goes18": GOES18_CONFIG,
     "goes19": GOES19_CONFIG,
     "himawari8": HIMAWARI8_CONFIG,
     "himawari9": HIMAWARI9_CONFIG,
+    "mtg-i1": MTG_I1_CONFIG,
+}
+
+# ---------------------------------------------------------------------------
+# Cross-instrument band equivalence (closest spectral centers)
+# ---------------------------------------------------------------------------
+
+# ABI band -> FCI (satpy fci_l1c_nc) channel. Used when one satellite of a
+# stereo pair is an FCI: the retrieval is configured with the ABI band name
+# and the FCI side loads its closest equivalent. ABI C09 (6.9 um) and
+# C14 (11.2 um) have no FCI twin and are absent.
+ABI_TO_FCI_BAND = {
+    "C01": "vis_04",   # 0.47 / 0.444 um
+    "C02": "vis_06",   # 0.64 / 0.64  um
+    "C03": "vis_08",   # 0.865 / 0.865 um
+    "C04": "nir_13",   # 1.378 / 1.38 um
+    "C05": "nir_16",   # 1.61 / 1.61  um
+    "C06": "nir_22",   # 2.25 / 2.25  um
+    "C07": "ir_38",    # 3.90 / 3.80  um
+    "C08": "wv_63",    # 6.19 / 6.30  um
+    "C10": "wv_73",    # 7.34 / 7.35  um
+    "C11": "ir_87",    # 8.44 / 8.70  um
+    "C12": "ir_97",    # 9.61 / 9.66  um
+    "C13": "ir_105",   # 10.35 / 10.50 um
+    "C15": "ir_123",   # 12.30 / 12.30 um
+    "C16": "ir_133",   # 13.30 / 13.30 um
 }
 
 
