@@ -31,7 +31,8 @@ from stereo_winds.config import SATELLITE_CONFIGS
 from stereo_winds.disparity import StereoDisparity
 from stereo_winds.student_dataset import DEFAULT_FLOW_BANDS, DEFAULT_RAD_BANDS
 from infer_student_global import (
-    load_student, open_cubes, infer_one_time, time_to_yyyymm,
+    load_student, open_cubes, infer_one_time, infer_one_time_allbands,
+    time_to_yyyymm,
 )
 
 VAR_KEYS = ("u_wind", "v_wind", "cloud_top_height", "quality_flag",
@@ -115,6 +116,10 @@ def main():
     ap.add_argument("--eval-band", default="C14",
                     help="For a multi-band model, which flow band's winds to "
                          "write (single-band models ignore this).")
+    ap.add_argument("--all-bands", action="store_true",
+                    help="Multi-band: write every band from ONE forward pass. "
+                         "--out-zarr must contain a '{band}' token; one store "
+                         "per band is created (e.g. student_quad_{band}.zarr).")
     ap.add_argument("--out-zarr", required=True)
     ap.add_argument("--max-scenes", type=int, default=-1,
                     help="If >0, cap the number of scenes (debug).")
@@ -144,17 +149,30 @@ def main():
     attrs = {"satellite_id": sat.satellite_id,
              "flow_bands": ",".join(flow_bands), "rad_bands": ",".join(rad_bands)}
 
-    if not os.path.exists(args.out_zarr):
-        print(f"creating template store: {args.out_zarr}", flush=True)
-        prealloc_template(args.out_zarr, eval_times_arr, H, W, attrs)
+    # Which bands (and stores) we write. all-bands => one store per flow band,
+    # produced from a single forward pass; else the single --eval-band store.
+    if args.all_bands:
+        if band_idx is None:
+            raise ValueError("--all-bands requires a multi-band model")
+        if "{band}" not in args.out_zarr:
+            raise ValueError("--all-bands: --out-zarr must contain a '{band}' token")
+        stores = {b: args.out_zarr.format(band=b) for b in flow_bands}
     else:
-        existing_t = np.asarray(xr.open_zarr(args.out_zarr, chunks=None).time.values)
-        if not np.array_equal(existing_t, eval_times_arr):
-            raise ValueError(
-                f"existing store at {args.out_zarr} has a different time coord; "
-                "delete it or use a fresh --out-zarr")
+        stores = {args.eval_band if band_idx is not None else "_single": args.out_zarr}
 
-    todo = _resume_todo(args.out_zarr)
+    for path in stores.values():
+        if not os.path.exists(path):
+            print(f"creating template store: {path}", flush=True)
+            prealloc_template(path, eval_times_arr, H, W, attrs)
+        else:
+            existing_t = np.asarray(xr.open_zarr(path, chunks=None).time.values)
+            if not np.array_equal(existing_t, eval_times_arr):
+                raise ValueError(
+                    f"existing store at {path} has a different time coord; "
+                    "delete it or use a fresh --out-zarr")
+
+    # Resume off the first store (all bands are written together per scene).
+    todo = _resume_todo(next(iter(stores.values())))
     print(f"{n_scenes - len(todo)} scenes already filled; processing {len(todo)} new",
           flush=True)
     if len(todo) == 0:
@@ -178,14 +196,23 @@ def main():
         try:
             cubes = get_cubes(yyyymm)
             print(f"[{k+1}/{len(todo)}] (slot {int(i)}) {t0}", flush=True)
-            arrs = infer_one_time(
-                model, disp, cubes, sat, t0, flow_bands, rad_bands,
-                row_strip=args.row_strip, band_idx=band_idx,
-            )
+            if args.all_bands:
+                per_band = infer_one_time_allbands(
+                    model, disp, cubes, sat, t0, flow_bands, rad_bands,
+                    row_strip=args.row_strip,
+                )
+                arrs_by_store = {stores[b]: per_band[b] for b in flow_bands}
+            else:
+                arrs = infer_one_time(
+                    model, disp, cubes, sat, t0, flow_bands, rad_bands,
+                    row_strip=args.row_strip, band_idx=band_idx,
+                )
+                arrs_by_store = {args.out_zarr: arrs}
         except Exception as e:
             print(f"  skip slot {int(i)} ({t0}): {type(e).__name__}: {e}", flush=True)
             continue
-        write_scene(args.out_zarr, int(i), arrs)
+        for path, arrs in arrs_by_store.items():
+            write_scene(path, int(i), arrs)
 
     print("done", flush=True)
 
