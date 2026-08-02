@@ -457,9 +457,10 @@ def process_fci_remap(
     import shutil
 
     from zeus.datasets.core.base import DataSourceConfig
-    from zeus.datasets.sources.mtg_fci import FCI
+    from zeus.datasets.sources.mtg_fci import FCI, BANDS_VIS as FCI_BANDS_VIS
 
     from .config import ABI_TO_FCI_BAND
+    from .data_loading import _block_mean
 
     ref_cfg = SATELLITE_CONFIGS[remap_to]
     sat_cfg = SATELLITE_CONFIGS[satellite]
@@ -469,9 +470,21 @@ def process_fci_remap(
     if missing:
         raise ValueError(f"No FCI twin for bands {missing}; "
                          f"available: {sorted(ABI_TO_FCI_BAND)}")
-    fci_bands = [ABI_TO_FCI_BAND[b] for b in bands]
 
-    src = FCI(config=DataSourceConfig(cache_dir=data_cache_dir), bands=fci_bands)
+    # Split into same-native-resolution groups so satpy never has to
+    # cross-resample (mixed 1 km / 2 km loads through the native resampler
+    # on the synchronous scheduler are pathologically slow). The 1 km
+    # solar group is aggregated to the 2 km grid with a numpy block-mean.
+    vis_group = [b for b in bands if ABI_TO_FCI_BAND[b] in FCI_BANDS_VIS]
+    ir_group = [b for b in bands if ABI_TO_FCI_BAND[b] not in FCI_BANDS_VIS]
+    groups: list[tuple[str, list[str], FCI]] = []
+    for gname, gbands in (("ir", ir_group), ("vis", vis_group)):
+        if gbands:
+            groups.append((gname, gbands, FCI(
+                config=DataSourceConfig(cache_dir=data_cache_dir),
+                bands=[ABI_TO_FCI_BAND[b] for b in gbands],
+            )))
+    src = groups[0][2]  # any source: shared cycle cache dir for purge
 
     existing_cache: dict[Path, set] = {}
 
@@ -496,28 +509,36 @@ def process_fci_remap(
 
         logger.info("[%d/%d] %s %s (%d bands)", i + 1, len(timestamps),
                     satellite, t.strftime("%Y-%m-%d %H:%M"), len(todo))
-        try:
-            # One download + one satpy load for ALL bands of this cycle
-            ds_fci = src.data_at_time(t)
-        except Exception as e:
-            logger.warning("  Failed to load FCI cycle at %s: %s", t, e)
-            n_fail += len(todo)
-            continue
+        for gname, gbands, gsrc in groups:
+            todo_g = [b for b in gbands if b in todo]
+            if not todo_g:
+                continue
+            try:
+                # One download + one same-area satpy load per group
+                ds_fci = gsrc.data_at_time(t)
+            except Exception as e:
+                logger.warning("  Failed to load FCI %s group at %s: %s",
+                               gname, t, e)
+                n_fail += len(todo_g)
+                continue
 
-        rad = ds_fci["Rad"].values[0]  # (band, y, x), y ascending (south-up)
-        for band in todo:
-            bi = fci_bands.index(ABI_TO_FCI_BAND[band])
-            arr = rad[bi][::-1].astype(np.float32)  # north-up, LUT convention
-            remapped = remap_image(arr, col_b, row_b).astype(np.float32)
-            ds_out = _scene_to_dataset(
-                remapped, t, ref_cfg, band,
-                long_name="FCI L1c Effective Radiance (remapped)",
-                units=str(ds_fci["Rad"].attrs.get("units", "")),
-            )
-            zp = _store(band, t)
-            append_to_zarr(ds_out, zp)
-            existing_cache.setdefault(zp, set()).add(np.datetime64(t, "ns"))
-            n_success += 1
+            gnames = [ABI_TO_FCI_BAND[b] for b in gbands]
+            rad = ds_fci["Rad"].values[0]  # (band, y, x), y ascending
+            for band in todo_g:
+                arr = rad[gnames.index(ABI_TO_FCI_BAND[band])]
+                if gname == "vis":
+                    arr = _block_mean(arr, 2)  # 1 km solar -> 2 km grid
+                arr = arr[::-1].astype(np.float32)  # north-up, LUT convention
+                remapped = remap_image(arr, col_b, row_b).astype(np.float32)
+                ds_out = _scene_to_dataset(
+                    remapped, t, ref_cfg, band,
+                    long_name="FCI L1c Effective Radiance (remapped)",
+                    units=str(ds_fci["Rad"].attrs.get("units", "")),
+                )
+                zp = _store(band, t)
+                append_to_zarr(ds_out, zp)
+                existing_cache.setdefault(zp, set()).add(np.datetime64(t, "ns"))
+                n_success += 1
 
         if purge_cache:
             cycle_dir = src._get_cache_dir(src._snap_time(t))
