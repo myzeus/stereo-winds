@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 COLOR_TEACHER = "#e8743b"   # orange (stereo, cross-satellite)
 COLOR_STUDENT = "#2a9d8f"   # teal (single-satellite)
 COLOR_AMV = "#4393c3"       # steel blue (operational NOAA AMV)
+COLOR_ERA5 = "#6a51a3"      # purple (ERA5 reanalysis)
 
 
 def qa_mask(u, v, h, chi2, qf, chi2_max):
@@ -116,7 +117,12 @@ def main():
     ap.add_argument("--dist-range", nargs=2, type=float, default=None,
                     help="crop to along-track distance window (km) after loading")
     ap.add_argument("--amv-npz", default=None,
-                    help="NOAA AMV npz (lat/lon/u/v/h/band); enables 3-panel mode")
+                    help="NOAA AMV npz (lat/lon/u/v/h/band); enables multi-panel mode")
+    ap.add_argument("--era5-from", default=None,
+                    help="ERA5 curtain npz (e_dp/e_hp/e_up/e_vp along track); adds a 4th panel")
+    ap.add_argument("--time", default=None,
+                    help="override the title timestamp (e.g. 2025-11-07T21:00) if the "
+                         "bundle/granule frame time is missing")
     ap.add_argument("--corridor-km", type=float, default=75.0,
                     help="keep AMVs within this cross-track distance of the nadir track")
     ap.add_argument("--chi2-max", type=float, default=1.0)
@@ -124,8 +130,8 @@ def main():
                     help="place a barb every N along-track samples")
     ap.add_argument("--dbz-min", type=float, default=-28.0)
     ap.add_argument("--dbz-max", type=float, default=20.0)
-    ap.add_argument("--orient", choices=["horizontal", "vertical"], default="horizontal",
-                    help="3-panel layout: horizontal (1x3, spans page top) or vertical (3x1)")
+    ap.add_argument("--orient", choices=["horizontal", "vertical", "grid"], default="horizontal",
+                    help="multi-panel layout: horizontal (1xN), vertical (Nx1), or grid (2xceil(N/2))")
     ap.add_argument("--dump-bundle", default=None,
                     help="save curtain + sampled winds to an npz for offline re-plotting")
     ap.add_argument("--from-bundle", default=None,
@@ -221,6 +227,13 @@ def main():
         na = sum(len(p[0]) for p in amv_pts)
         log.info(f"AMV points within {args.corridor_km:.0f} km corridor: {na}")
 
+    # ERA5 reanalysis curtain (its own npz; independent of bundle/live mode)
+    era5_pts = None
+    if args.era5_from:
+        ez = np.load(args.era5_from)
+        era5_pts = [(ez["e_dp"], ez["e_hp"], ez["e_up"], ez["e_vp"])]
+        log.info(f"ERA5 barbs: {ez['e_dp'].size}")
+
     st = args.barb_stride
     idx = np.arange(0, lat.size, st)
     X, Y = np.meshgrid(dist, hgt, indexing="ij")
@@ -263,12 +276,12 @@ def main():
         ax.set_ylim(0, hgt.max())
         ax.set_xlim(dist.min(), dist.max())
         ax.text(0.015, 0.94, label, transform=ax.transAxes, fontsize=9.5,
-                fontweight="bold", va="top",
-                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.6", alpha=0.9))
+                fontweight="bold", va="top", zorder=20,
+                bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.6", alpha=0.95))
         ax.set_ylabel("Height (km)") if show_y else ax.tick_params(labelleft=False)
         ax.set_xlabel("Along-track distance (km)") if show_x else ax.tick_params(labelbottom=False)
 
-    t0 = frame_start[:16]
+    t0 = (args.time or frame_start)[:16]
 
     if amv_pts is None:
         # legacy single panel: teacher + student overlaid
@@ -290,27 +303,39 @@ def main():
         sources = [("(a) Stereo teacher", COLOR_TEACHER, teacher_bands, "bands"),
                    ("(b) Single-sat student", COLOR_STUDENT, student_bands, "bands"),
                    ("(c) NOAA GOES-19 AMV", COLOR_AMV, amv_pts, "points")]
+        if era5_pts is not None:
+            sources.append(("(d) ERA5 reanalysis", COLOR_ERA5, era5_pts, "points"))
+        n = len(sources)
         suptitle = (f"Cloud-top winds vs. EarthCARE CPR reflectivity  ·  {t0}Z  ·  "
                     f"ITCZ deep convection  ·  lat [{lat.min():.0f}, {lat.max():.0f}]")
-        if args.orient == "horizontal":
-            # 1x3 across the page top; shared height axis, one colorbar on the right
-            fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.3), sharey=True)
-            for i, (lab, col, data, kind) in enumerate(sources):
-                pm = draw_curtain(axes[i])
-                (draw_bands if kind == "bands" else draw_points)(axes[i], data, col)
-                style_ax(axes[i], lab, show_x=True, show_y=(i == 0))
-            fig.suptitle(suptitle, fontsize=10, y=0.995)
-            fig.subplots_adjust(left=0.05, right=0.93, top=0.88, bottom=0.12, wspace=0.06)
-            cax = fig.add_axes([0.94, 0.12, 0.010, 0.76])
-        else:
-            fig, axes = plt.subplots(3, 1, figsize=(11.5, 11.0), sharex=True)
-            for i, (lab, col, data, kind) in enumerate(sources):
-                pm = draw_curtain(axes[i])
-                (draw_bands if kind == "bands" else draw_points)(axes[i], data, col)
-                style_ax(axes[i], lab, show_x=(i == 2), show_y=True)
-            axes[0].set_title(suptitle, fontsize=11)
+        if args.orient == "vertical":
+            nrow, ncol, figsize = n, 1, (11.5, 3.6 * n)
+        elif args.orient == "grid":
+            ncol = 2; nrow = int(np.ceil(n / 2)); figsize = (13.0, 4.2 * nrow)
+        else:  # horizontal 1xN across the page top
+            nrow, ncol, figsize = 1, n, (3.7 * n + 1.4, 4.3)
+        fig, axes = plt.subplots(nrow, ncol, figsize=figsize,
+                                 sharex=(args.orient == "vertical"),
+                                 sharey=(args.orient != "vertical"), squeeze=False)
+        axflat = axes.ravel()
+        pm = None
+        for i, (lab, col, data, kind) in enumerate(sources):
+            ax = axflat[i]
+            rr, cc = divmod(i, ncol)
+            pm = draw_curtain(ax)
+            (draw_bands if kind == "bands" else draw_points)(ax, data, col)
+            style_ax(ax, lab, show_x=(rr == nrow - 1), show_y=(cc == 0))
+        for k in range(n, nrow * ncol):
+            axflat[k].axis("off")
+        if args.orient == "vertical":
+            axflat[0].set_title(suptitle, fontsize=11)
             fig.subplots_adjust(left=0.07, right=0.90, top=0.955, bottom=0.06, hspace=0.09)
             cax = fig.add_axes([0.915, 0.06, 0.014, 0.895])
+        else:
+            fig.suptitle(suptitle, fontsize=10, y=0.995)
+            fig.subplots_adjust(left=0.05, right=0.93, top=0.90, bottom=0.10,
+                                wspace=0.06, hspace=0.14)
+            cax = fig.add_axes([0.94, 0.10, 0.010, 0.80])
         fig.colorbar(pm, cax=cax).set_label("CPR reflectivity (dBZ)")
     for ext in ("png", "pdf"):
         p = Path(args.out).with_suffix(f".{ext}")
