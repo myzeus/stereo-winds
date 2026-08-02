@@ -43,10 +43,6 @@ def fixed_grid_to_geodetic(
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64)
 
-    # For y-sweep (AHI), swap x and y before computing
-    if sat.sweep == "y":
-        x, y = y, x
-
     sin_x = np.sin(x)
     cos_x = np.cos(x)
     sin_y = np.sin(y)
@@ -55,8 +51,15 @@ def fixed_grid_to_geodetic(
     a2 = a * a
     b2 = b * b
 
-    # Quadratic coefficients for ray–ellipsoid intersection
-    a_coeff = sin_x**2 + cos_x**2 * (cos_y**2 + (a2 / b2) * sin_y**2)
+    # Quadratic coefficients for ray–ellipsoid intersection.
+    # The sweep axis sets the rotation composition of the view ray:
+    #   x-sweep (GOES ABI):        s = r (cos x cos y, -sin x,       cos x sin y)
+    #   y-sweep (AHI/SEVIRI/FCI):  s = r (cos y cos x, -cos y sin x, sin y)
+    # In both, x is the E-W scanning angle and y the N-S angle.
+    if sat.sweep == "y":
+        a_coeff = cos_y**2 + (a2 / b2) * sin_y**2
+    else:
+        a_coeff = sin_x**2 + cos_x**2 * (cos_y**2 + (a2 / b2) * sin_y**2)
     b_coeff = -2.0 * H * cos_x * cos_y
     c_coeff = H * H - a2
 
@@ -68,9 +71,14 @@ def fixed_grid_to_geodetic(
 
     r_s = (-b_coeff - np.sqrt(disc_safe)) / (2.0 * a_coeff)
 
-    sx = r_s * cos_x * cos_y
-    sy = -r_s * sin_x
-    sz = r_s * cos_x * sin_y
+    if sat.sweep == "y":
+        sx = r_s * cos_y * cos_x
+        sy = -r_s * cos_y * sin_x
+        sz = r_s * sin_y
+    else:
+        sx = r_s * cos_x * cos_y
+        sy = -r_s * sin_x
+        sz = r_s * cos_x * sin_y
 
     lat_rad = np.arctan((a2 / b2) * sz / np.sqrt((H - sx) ** 2 + sy**2))
     lon_rad = np.radians(sat.sub_lon_deg) - np.arctan2(sy, H - sx)
@@ -149,16 +157,16 @@ def geodetic_to_fixed_grid(
     # at h ≈ 0 this reduces exactly to  p_x > a² / H.
     visible = p_x * H > a * a
 
-    # Extract scanning angles (x-sweep convention):
-    #   s_x = r_s * cos(x) * cos(y)
-    #   s_y = -r_s * sin(x)
-    #   s_z = r_s * cos(x) * sin(y)
-    x_angle = np.arctan2(-s_y, np.sqrt(s_x**2 + s_z**2))
-    y_angle = np.arctan2(s_z, s_x)
-
-    # For y-sweep (AHI), swap the angles
+    # Extract scanning angles. x stays E-W and y N-S in both conventions;
+    # the sweep axis only sets which angle is the asin-of-norm term:
+    #   x-sweep (GOES): x = asin(-s_y/|s|),    y = atan2(s_z, s_x)
+    #   y-sweep (CGMS): x = atan2(-s_y, s_x),  y = asin(s_z/|s|)
     if sat.sweep == "y":
-        x_angle, y_angle = y_angle, x_angle
+        x_angle = np.arctan2(-s_y, s_x)
+        y_angle = np.arctan2(s_z, np.sqrt(s_x**2 + s_y**2))
+    else:
+        x_angle = np.arctan2(-s_y, np.sqrt(s_x**2 + s_z**2))
+        y_angle = np.arctan2(s_z, s_x)
 
     x_angle = np.where(visible, x_angle, np.nan)
     y_angle = np.where(visible, y_angle, np.nan)
