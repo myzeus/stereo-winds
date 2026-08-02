@@ -151,19 +151,23 @@ def _forward_full_disk(
     model: StudentWindsModel,
     flow_arr: np.ndarray, rad_arr: np.ndarray, geom_arr: np.ndarray,
     row_strip: int = 1024, halo: int = 8, device: str = "cuda",
-    band_idx: int | None = None,
+    band_idx: int | None = None, all_bands: bool = False,
 ) -> dict[str, np.ndarray]:
     """Forward in row-strips; returns (H, W) arrays in physical units.
 
     For a multi-band model ``predict`` returns per-band ``(B, nb, H, W)``;
     ``band_idx`` selects one band so the rest of the pipeline stays single-band.
+    With ``all_bands=True`` every band is kept and each output array is
+    ``(nb, H, W)`` instead (one forward pass, all bands).
     """
     H, W = flow_arr.shape[1], flow_arr.shape[2]
     keys = ["u_mean", "v_mean", "h_mean", "u_logvar", "v_logvar", "h_logvar"]
     # If the trained model has a chi² head, surface it too.
     if getattr(model, "predict_chi2", False):
         keys.append("chi2")
-    out = {k: np.full((H, W), np.nan, np.float32) for k in keys}
+    nb = int(getattr(model, "n_bands", 1))
+    shape = (nb, H, W) if all_bands else (H, W)
+    out = {k: np.full(shape, np.nan, np.float32) for k in keys}
     with torch.no_grad():
         for r in range(0, H, row_strip):
             r1_keep = min(H, r + row_strip)
@@ -173,11 +177,21 @@ def _forward_full_disk(
             rt = torch.from_numpy(rad_arr[:, r0_in:r1_in]).unsqueeze(0).to(device)
             gt = torch.from_numpy(geom_arr[:, r0_in:r1_in]).unsqueeze(0).to(device)
             o = model.predict(ft, rt, gt)
+            keep0 = r - r0_in
+            keep1 = keep0 + (r1_keep - r)
+            if all_bands:
+                # Keep every band: (B, nb, H, W) -> (nb, strip, W); a key that is
+                # not per-band (B, H, W) is broadcast across the band axis.
+                for k in keys:
+                    val = o[k]
+                    if val.ndim == 4:
+                        out[k][:, r:r1_keep] = val[0, :, keep0:keep1].cpu().numpy()
+                    else:
+                        out[k][:, r:r1_keep] = val[0, keep0:keep1].cpu().numpy()[None]
+                continue
             # Multi-band: predict returns (B, nb, H, W) per key — pick one band.
             if band_idx is not None:
                 o = {k: (v[:, band_idx] if v.ndim == 4 else v) for k, v in o.items()}
-            keep0 = r - r0_in
-            keep1 = keep0 + (r1_keep - r)
             for k in keys:
                 out[k][r:r1_keep] = o[k][0, keep0:keep1].cpu().numpy()
     return out
@@ -213,6 +227,12 @@ def infer_one_time(
     raw = _forward_full_disk(model, flow_arr, rad_arr, geom_arr,
                              row_strip=row_strip, halo=halo, device=device,
                              band_idx=band_idx)
+    return _assemble_vars(raw, finite_mask)
+
+
+def _assemble_vars(raw: dict[str, np.ndarray],
+                   finite_mask: np.ndarray) -> dict[str, np.ndarray]:
+    """Convert a raw (H, W) forward output to the stereo-cache variable schema."""
     u = np.where(finite_mask, raw["u_mean"], np.nan)
     v = np.where(finite_mask, raw["v_mean"], np.nan)
     h_km = np.where(finite_mask, raw["h_mean"], np.nan)
@@ -240,6 +260,36 @@ def infer_one_time(
         "sigma_v": sigma_v.astype(np.float32),
         "sigma_h": (sigma_h_km * 1000.0).astype(np.float32),     # m
     }
+
+
+def infer_one_time_allbands(
+    model: StudentWindsModel,
+    disp: StereoDisparity,
+    cubes: dict[str, xr.Dataset],
+    sat: SatelliteConfig,
+    t0,
+    flow_bands, rad_bands,
+    row_strip: int = 1024,
+    halo: int = 8,
+    device: str = "cuda",
+) -> dict[str, dict[str, np.ndarray]]:
+    """Full-disk inference at one time for **every** band in one forward pass.
+
+    Returns ``{band_name: var_dict}`` where each ``var_dict`` matches the
+    stereo-cache schema (as :func:`infer_one_time`).  The expensive RAFT flow +
+    trunk forward runs once; only the cheap per-band output slice differs.
+    """
+    rad_time_frames = int(getattr(model, "rad_time_frames", 1))
+    flow_arr, rad_arr, geom_arr, finite_mask = _stack_inputs(
+        cubes, sat, t0, flow_bands, rad_bands, disp,
+        rad_time_frames=rad_time_frames,
+    )
+    raw = _forward_full_disk(model, flow_arr, rad_arr, geom_arr,
+                             row_strip=row_strip, halo=halo, device=device,
+                             all_bands=True)
+    nb = raw["u_mean"].shape[0]
+    return {flow_bands[bi]: _assemble_vars({k: raw[k][bi] for k in raw}, finite_mask)
+            for bi in range(nb)}
 
 
 def time_to_yyyymm(t0) -> str:
