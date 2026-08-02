@@ -32,7 +32,7 @@ from .solver import (
     pixels_to_wind_ms,
     solve_stereo_winds,
 )
-from .time_model import compute_scene_dt_fields
+from .time_model import compute_scene_dt_fields, load_abi_time_lut
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +208,14 @@ class StereoWindPipeline:
         # nearest-second cross-satellite matching)
         logger.info("Step 4: Building design matrix...")
         w_u, w_v = self._get_parallax_vectors(sat_a, sat_b)
-        scene_dts = compute_scene_dt_fields(time_info, sat_a, sat_b, col_b, row_b)
+        lut_path = Path(cfg.abi_time_lut_path) if cfg.abi_time_lut_path \
+            else cfg.cache_dir / "abi_time_model.nc"
+        abi_lut = None
+        if lut_path.exists() and sat_a.satellite_id.startswith("goes"):
+            logger.info("  Using ABI per-pixel time LUT: %s", lut_path.name)
+            abi_lut = load_abi_time_lut(str(lut_path))
+        scene_dts = compute_scene_dt_fields(time_info, sat_a, sat_b, col_b, row_b,
+                                            abi_time_lut=abi_lut)
         for name in ("B_minus", "B_plus"):
             nominal = (time_info[name]["t_nominal"] - t0).total_seconds()
             actual = float(np.nanmedian(scene_dts[name]))

@@ -167,6 +167,11 @@ class StereoPairConfig:
     max_zenith_angle: float = 80.0
     chi2_threshold: float = 10.0
 
+    # Optional Carr et al. ABI per-pixel scan-time LUT for satellite A
+    # (see time_model.load_abi_time_lut). Empty -> auto-discover
+    # {cache_dir}/abi_time_model.nc, else fall back to the linear model.
+    abi_time_lut_path: str = ""
+
     @classmethod
     def from_satellites(
         cls,
