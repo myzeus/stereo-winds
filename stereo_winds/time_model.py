@@ -101,6 +101,36 @@ def compute_scene_times(
 
 _UNIX_EPOCH = np.datetime64("1970-01-01T00:00:00")
 
+_abi_lut_cache: dict[str, np.ndarray] = {}
+
+
+def load_abi_time_lut(nc_path: str) -> np.ndarray:
+    """Load a Carr et al. ABI time-model LUT (per-pixel scan-time offsets).
+
+    The supplement of Carr et al. (2020, RS 12:3779) provides per-scan-mode
+    netCDFs with ``FD_pixel_times`` stored as (cols, rows) timedeltas
+    relative to the L1b product start time ("add the product start time to
+    the LUT values"). GOES-East Mode 6A is 'ABI-Timeline05B_Mode 6A_*.nc'.
+    Returns (rows, cols) float64 seconds. Values are Band-2 referenced;
+    per-band detector offsets are < 1 s and ignored.
+
+    The linear N->S model deviates from the true swath pattern by up to
+    ~±45 s (row) plus ~12 s within-row spread — irrelevant when both stereo
+    partners share the model (errors cancel in the pairs) but directly
+    biasing cross-instrument dt when the partner has exact pixel times
+    (e.g. FCI).
+    """
+    key = str(nc_path)
+    if key not in _abi_lut_cache:
+        ds = xr.open_dataset(key, decode_timedelta=True)
+        try:
+            vals = ds["FD_pixel_times"].values
+        finally:
+            ds.close()
+        lut = vals.astype("timedelta64[ms]").astype(np.float64).T / 1e3
+        _abi_lut_cache[key] = lut
+    return _abi_lut_cache[key]
+
 
 def _to_unix(t: datetime) -> float:
     """Datetime (naive = UTC) → float Unix seconds."""
@@ -158,6 +188,7 @@ def compute_scene_dt_fields(
     sat_b: SatelliteConfig,
     col_b: np.ndarray,
     row_b: np.ndarray,
+    abi_time_lut: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Per-pixel (H, W) time offsets (seconds) of each scene relative to A0.
 
@@ -176,6 +207,10 @@ def compute_scene_dt_fields(
     - Pixels the B satellite cannot see fall back to the nominal offset so
       the design matrix stays finite (their disparities are NaN-masked
       anyway).
+    - ``abi_time_lut``: optional (H, W) per-pixel scan-time LUT for the A
+      satellite (see :func:`load_abi_time_lut`). Replaces the linear model
+      for the A0 reference of the cross-satellite pairs — the temporal
+      A pairs are unaffected (any shared scan model cancels there).
 
     Parameters
     ----------
@@ -194,6 +229,17 @@ def compute_scene_dt_fields(
 
     t_a0 = _scene_row_times(time_info["A0"], sat_a, rows_a)  # (H, 1)
     t_a0_nom = _to_unix(time_info["A0"]["t_nominal"])
+
+    # Per-pixel A0 reference for the cross-satellite pairs: LUT if given
+    # (exact swath pattern), else the linear row model.
+    if abi_time_lut is not None:
+        if abi_time_lut.shape != (H, W):
+            raise ValueError(
+                f"abi_time_lut shape {abi_time_lut.shape} != grid ({H}, {W})")
+        a0_start = time_info["A0"].get("t_start") or time_info["A0"]["t_nominal"]
+        t_a0_ref = _to_unix(a0_start) + abi_time_lut  # (H, W)
+    else:
+        t_a0_ref = t_a0  # (H, 1), broadcasts
 
     out: dict[str, np.ndarray] = {}
 
@@ -228,7 +274,7 @@ def compute_scene_dt_fields(
 
         t_k = _sample_b_grid(np.asarray(pt_b, dtype=np.float64), col_b, row_b,
                              fill=np.nan)
-        dt = t_k - t_a0  # (H, W) − (H, 1)
+        dt = t_k - t_a0_ref  # (H, W) − (H, W) or (H, 1)
         out[name] = np.where(np.isfinite(dt), dt, fill_dt).astype(np.float64)
 
     return out
