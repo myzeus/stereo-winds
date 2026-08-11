@@ -14,17 +14,11 @@ Batch contract (from ``StudentXBatchDataset``): keys ``flow`` (B,4*n_flow,H,W),
 from __future__ import annotations
 
 import logging
-import sys
-from pathlib import Path
 
 import torch
 
-_zeus = str(Path(__file__).resolve().parent.parent / "zeus")
-if _zeus not in sys.path:
-    sys.path.insert(0, _zeus)
-
-from zeus.models.base_lightning_module import BaseLightningModule
-from zeus.datasets.transform import StandardScalar
+from stereo_winds.nn.base_module import BaseLightningModule
+from stereo_winds.nn.transform import StandardScalar
 
 from .student_model import PixelwiseWindStudent, UNetWindStudent
 from .student_module import heteroscedastic_nll, vector_nll, huber_uv
