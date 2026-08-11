@@ -1,0 +1,10 @@
+This directory contains a single-channel adaptation of RAFT:
+
+  RAFT: Recurrent All-Pairs Field Transforms for Optical Flow
+  Zachary Teed and Jia Deng, ECCV 2020
+  https://github.com/princeton-vl/RAFT
+
+The original RAFT code is licensed under the BSD-3-Clause license (see
+LICENSE-RAFT). Files here (raft.py, extractor.py, update.py, corr.py,
+utils/utils.py) are derived from it, modified for single-channel (input_dim=1)
+geostationary imagery. Redistributed under BSD-3-Clause.

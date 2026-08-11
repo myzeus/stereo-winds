@@ -73,9 +73,7 @@ class StereoDisparity:
         lowmem: bool = False,
     ):
         self.lowmem = lowmem
-        import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "zeus"))
-        from zeus.inference.inference_flows import FlowRunner
+        from stereo_winds.flow import FlowRunner
 
         compat_path = _ensure_compat_checkpoint(model_ckpt_path)
 
