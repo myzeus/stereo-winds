@@ -1,0 +1,12 @@
+stereo-winds
+Copyright (c) 2026 Zeus AI and stereo-winds contributors
+
+This product includes software developed as a single-channel adaptation of
+RAFT (Recurrent All-Pairs Field Transforms for Optical Flow), Teed & Deng,
+ECCV 2020, https://github.com/princeton-vl/RAFT, licensed under BSD-3-Clause.
+The vendored files live under stereo_winds/flow/raft/ with their original
+license in stereo_winds/flow/raft/LICENSE-RAFT.
+
+The stereo retrieval solver follows the weighted-least-squares formulation of
+Carr et al. (2020), "Estimating Atmospheric Motion Vectors and Cloud-Top
+Heights from Cross-Track Stereo Observations."
