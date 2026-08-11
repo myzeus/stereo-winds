@@ -45,13 +45,15 @@ _WIND_VARS = ["u_component_of_wind", "v_component_of_wind", "geopotential"]
 
 
 def open_era5_reader(levels=DEFAULT_LEVELS):
-    """Construct the zeus ERA5 reader over the public arco-era5 zarr.
+    """Construct an ERA5 reader over the public ARCO-ERA5 zarr.
 
-    Imported lazily so importing this module never triggers a remote open.
+    Not included in the standalone build. The rest of this module (matching,
+    interpolation, metrics) works on any ERA5 xarray dataset you supply.
     """
-    from zeus.datasets.nwp.era5 import ERA5
-
-    return ERA5(levels=list(levels))
+    raise NotImplementedError(
+        "The bundled ERA5 reader is not part of the standalone stereo-winds "
+        "build. Pass your own ERA5 xarray.Dataset to the matching/metric "
+        "helpers in this module instead.")
 
 
 def _normalize_lon(ds: xr.Dataset) -> xr.Dataset:
