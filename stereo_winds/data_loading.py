@@ -224,16 +224,14 @@ def _make_goes_source(
     cache_dir: str | Path | None = None,
     product: str = "ABI-L1b-RadF",
 ):
-    """Create a zeus GOES data source instance."""
-    from zeus.datasets.sources.goes import GOES
-    from zeus.datasets.core.base import DataSourceConfig
+    """Create a standalone public-S3 GOES ABI reader."""
+    from stereo_winds.readers.goes import GOES
 
-    config = DataSourceConfig(cache_dir=cache_dir)
     return GOES(
-        config=config,
         satellite=satellite,
         product=product,
         bands=[band],
+        cache_dir=cache_dir,
     )
 
 
@@ -300,11 +298,12 @@ def load_goes_scene(
     aux : dict (only if return_aux)
     """
     source = _make_goes_source(satellite, band, cache_dir, product)
-    logger.info("Loading %s %s at %s via zeus%s", satellite, band, t,
+    logger.info("Loading %s %s at %s%s", satellite, band, t,
                 " (streaming)" if stream else "")
 
-    if not stream:
-        # Ensure band-specific files are downloaded (zeus cache is not band-aware)
+    if not stream and hasattr(source, "_get_remote_files"):
+        # Legacy zeus source: cache is not band-aware, so force the band.
+        # The standalone reader self-downloads the correct band.
         _ensure_band_downloaded(source, t, band)
 
     ds = source.data_at_time(t, download=not stream)
