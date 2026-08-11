@@ -34,12 +34,7 @@ import torch.nn as nn
 import wandb
 from pytorch_lightning import LightningModule
 
-# Ensure zeus is importable for RAFT
-_zeus_path = str(Path(__file__).resolve().parent.parent / "zeus")
-if _zeus_path not in sys.path:
-    sys.path.insert(0, _zeus_path)
-
-from zeus.networks.raft.raft import RAFT
+from stereo_winds.flow.raft import RAFT
 
 from .differentiable_solver import DifferentiableStereoSolver
 
