@@ -124,6 +124,18 @@ class GOES:
         finally:
             raw.close()
 
+    def download(self, t: dt.datetime) -> list[Path]:
+        """Download the ABI file(s) for ``self.bands`` at ``t``; return paths."""
+        paths = []
+        for band in self.bands:
+            key = self._find_key(t, band)
+            local = self.cache_dir / self.satellite / Path(key).name
+            local.parent.mkdir(parents=True, exist_ok=True)
+            if not local.exists():
+                self.fs.get(key, str(local))
+            paths.append(local)
+        return paths
+
     def __repr__(self):
         return (f"GOES(satellite={self.satellite!r}, product={self.product!r}, "
                 f"bands={self.bands!r})")

@@ -461,17 +461,11 @@ def download_ahi(
     satellite: str = "himawari8",
     cache_dir: str | Path | None = None,
 ) -> list[Path]:
-    """Download AHI L1b files for a given time using zeus AHI source."""
-    from zeus.datasets.sources.ahi import AHI
-    from zeus.datasets.core.base import DataSourceConfig
-
-    config = DataSourceConfig(cache_dir=cache_dir)
-    source = AHI(
-        config=config,
-        satellite=satellite,
-        bands=[band],
-    )
-    return source.download(t)
+    """Download AHI L1b files. Not available in the standalone build."""
+    raise NotImplementedError(
+        "Himawari AHI loading is not included in the standalone stereo-winds "
+        "build. GOES-R ABI (readers.goes) and MTG FCI (readers.fci) are "
+        "supported; add an AHI reader to enable this path.")
 
 
 def load_stereo_scenes(
