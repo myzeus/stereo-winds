@@ -454,7 +454,12 @@ def process_fci_remap(
     -------
     (n_success, n_fail) counted per (time, band) writes
     """
-    import shutil
+    raise NotImplementedError(
+        "FCI training-data generation is not yet ported to the standalone "
+        "build (requires satpy + eumdac). GOES-R ABI training data is "
+        "supported.")
+
+    import shutil  # noqa: F401  (deferred FCI port below)
 
     from zeus.datasets.core.base import DataSourceConfig
     from zeus.datasets.sources.mtg_fci import FCI, BANDS_VIS as FCI_BANDS_VIS

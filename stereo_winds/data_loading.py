@@ -224,16 +224,14 @@ def _make_goes_source(
     cache_dir: str | Path | None = None,
     product: str = "ABI-L1b-RadF",
 ):
-    """Create a zeus GOES data source instance."""
-    from zeus.datasets.sources.goes import GOES
-    from zeus.datasets.core.base import DataSourceConfig
+    """Create a standalone public-S3 GOES ABI reader."""
+    from stereo_winds.readers.goes import GOES
 
-    config = DataSourceConfig(cache_dir=cache_dir)
     return GOES(
-        config=config,
         satellite=satellite,
         product=product,
         bands=[band],
+        cache_dir=cache_dir,
     )
 
 
@@ -300,11 +298,12 @@ def load_goes_scene(
     aux : dict (only if return_aux)
     """
     source = _make_goes_source(satellite, band, cache_dir, product)
-    logger.info("Loading %s %s at %s via zeus%s", satellite, band, t,
+    logger.info("Loading %s %s at %s%s", satellite, band, t,
                 " (streaming)" if stream else "")
 
-    if not stream:
-        # Ensure band-specific files are downloaded (zeus cache is not band-aware)
+    if not stream and hasattr(source, "_get_remote_files"):
+        # Legacy zeus source: cache is not band-aware, so force the band.
+        # The standalone reader self-downloads the correct band.
         _ensure_band_downloaded(source, t, band)
 
     ds = source.data_at_time(t, download=not stream)
@@ -388,7 +387,12 @@ def load_fci_scene(
     sat_config : SatelliteConfig with scanning-angle coordinates in radians
     aux : dict (only if return_aux)
     """
-    import dask
+    raise NotImplementedError(
+        "MTG-I FCI loading is not yet ported to the standalone build. It "
+        "requires satpy (fci_l1c_nc) + eumdac (EUMETSAT Data Store auth); a "
+        "standalone readers.fci is planned. GOES-R ABI is fully supported.")
+
+    import dask  # noqa: F401  (deferred FCI port below)
     from zeus.datasets.core.base import DataSourceConfig
     from zeus.datasets.sources.mtg_fci import FCI, BANDS_ALL
 
@@ -462,17 +466,11 @@ def download_ahi(
     satellite: str = "himawari8",
     cache_dir: str | Path | None = None,
 ) -> list[Path]:
-    """Download AHI L1b files for a given time using zeus AHI source."""
-    from zeus.datasets.sources.ahi import AHI
-    from zeus.datasets.core.base import DataSourceConfig
-
-    config = DataSourceConfig(cache_dir=cache_dir)
-    source = AHI(
-        config=config,
-        satellite=satellite,
-        bands=[band],
-    )
-    return source.download(t)
+    """Download AHI L1b files. Not available in the standalone build."""
+    raise NotImplementedError(
+        "Himawari AHI loading is not included in the standalone stereo-winds "
+        "build. GOES-R ABI (readers.goes) and MTG FCI (readers.fci) are "
+        "supported; add an AHI reader to enable this path.")
 
 
 def load_stereo_scenes(
