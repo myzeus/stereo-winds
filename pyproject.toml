@@ -36,9 +36,5 @@ dev = [
     "pyproj>=3.5",
 ]
 
-[project.scripts]
-stereo-winds = "scripts.run_stereo:main"
-stereo-winds-batch = "scripts.run_batch:main"
-
 [tool.setuptools.packages.find]
 include = ["stereo_winds*"]
