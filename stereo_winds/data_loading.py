@@ -387,7 +387,12 @@ def load_fci_scene(
     sat_config : SatelliteConfig with scanning-angle coordinates in radians
     aux : dict (only if return_aux)
     """
-    import dask
+    raise NotImplementedError(
+        "MTG-I FCI loading is not yet ported to the standalone build. It "
+        "requires satpy (fci_l1c_nc) + eumdac (EUMETSAT Data Store auth); a "
+        "standalone readers.fci is planned. GOES-R ABI is fully supported.")
+
+    import dask  # noqa: F401  (deferred FCI port below)
     from zeus.datasets.core.base import DataSourceConfig
     from zeus.datasets.sources.mtg_fci import FCI, BANDS_ALL
 

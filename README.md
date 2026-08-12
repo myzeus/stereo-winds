@@ -19,34 +19,32 @@ GOES-18 (137°W) ──┘
 ## Installation
 
 ```bash
-# Clone with zeus submodule (provides RAFT FlowRunner and data sources)
-git clone --recurse-submodules <repo-url>
+git clone <repo-url>
 cd stereo-winds
 
-# Install in editable mode
-pip install -e ".[dev]"
+pip install -e .              # core + inference (GOES-R ABI)
+pip install -e ".[viz]"       # + matplotlib/cartopy for plotting
+pip install -e ".[train]"     # + pytorch-lightning/wandb for training
+pip install -e ".[dev]"       # + pytest
 ```
+
+This is a self-contained build — no `zeus` submodule. GOES ABI data is read
+directly from NOAA's public S3 buckets (via `s3fs`), so **no account or
+credentials are required**.
 
 ### Requirements
 
 - Python 3.10+
 - PyTorch 2.0+ (GPU recommended for RAFT inference)
-- NumPy, SciPy, xarray, h5netcdf, netCDF4
-- Cartopy (for plotting)
-- `zeus` submodule (for RAFT model and satellite data downloads)
+- NumPy, SciPy, xarray, h5netcdf, netCDF4, s3fs, zarr
+- Cartopy/matplotlib (optional, `[viz]` extra)
+
+The RAFT optical-flow checkpoint (the "WindFlow" model — a RAFT network
+fine-tuned for geostationary imagery) is a separate download; point
+`--model-ckpt` / `model_ckpt` at a local `.pt`. Lightning checkpoints are
+converted automatically. *(A download link will accompany the release.)*
 
 ## Quick start
-
-### CLI
-
-```bash
-stereo-winds "2026-03-10T23:00" \
-    --sat-a goes19 --sat-b goes18 \
-    --band C14 \
-    --model-ckpt zeus/zeus/networks/weights/raft-128.202509.epoch1434.ckpt \
-    --device cuda \
-    --output-dir output/
-```
 
 ### Python API
 
@@ -113,7 +111,7 @@ write_netcdf(ds, "output/stereo_winds.nc")
 |------|-----------|----------|
 | GOES-19 (East) + GOES-18 (West) | 62° | Americas |
 | GOES-16 (Test) + GOES-18 (West) | 62° | Americas |
-| Himawari-8/9 + GOES-18 | ~82° | Pacific |
+| Himawari-8/9 + GOES-18 | ~82° | Pacific (AHI reader not yet ported — see below) |
 
 ## ABI bands
 
@@ -165,6 +163,23 @@ python -m pytest tests/ -v
 #   test_time_model.py — ABI/AHI scan time models
 ```
 
+## Standalone build notes
+
+This dependency-light release fully supports **GOES-R ABI**. A few sensors and
+paths are not yet ported and raise a clear error if called: **Himawari AHI**,
+**MTG-I FCI** (needs satpy + eumdac), the bundled **ERA5** reader, and
+**arraylake** batch output. The single-satellite full-disk "student" model
+(`nn/`, `student_*`) is included and trains/runs standalone (`[train]` extra).
+
+## License & attribution
+
+MIT — see [`LICENSE`](LICENSE). The optical-flow network under
+`stereo_winds/flow/raft/` is a single-channel adaptation of **RAFT** (Teed &
+Deng, ECCV 2020), redistributed under BSD-3-Clause (see
+`stereo_winds/flow/raft/LICENSE-RAFT` and [`NOTICE`](NOTICE)). The retrieval
+solver follows **Carr et al. (2020)**.
+
 ## References
 
 - Carr, J. L., Wu, D. L., Daniels, J., Friberg, M. D., Bresky, W., & Madani, H. (2020). GEO–GEO stereo-tracking of Atmospheric Motion Vectors (AMVs) from the geostationary ring. *Atmospheric Measurement Techniques*, 13, 3195–3215.
+- Teed, Z., & Deng, J. (2020). RAFT: Recurrent All-Pairs Field Transforms for Optical Flow. *ECCV 2020*.
