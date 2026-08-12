@@ -142,6 +142,8 @@ def _scene_to_dataset(
     t: dt.datetime,
     sat: SatelliteConfig,
     band: str,
+    long_name: str = "ABI L1b Radiance",
+    units: str = "W m-2 sr-1 um-1",
 ) -> xr.Dataset:
     """Wrap a 2D radiance array as a single-timestep xarray Dataset."""
     coords = _make_coords(sat)
@@ -157,9 +159,9 @@ def _scene_to_dataset(
                 ["time", "y", "x"],
                 data[np.newaxis, :, :].astype(np.float32),
                 attrs={
-                    "long_name": "ABI L1b Radiance",
+                    "long_name": long_name,
                     "standard_name": "toa_outgoing_radiance_per_unit_wavelength",
-                    "units": "W m-2 sr-1 um-1",
+                    "units": units,
                     "grid_mapping": "goes_imager_projection",
                 },
             ),
@@ -420,6 +422,138 @@ def process_satellite(
     return n_success, n_fail
 
 
+def process_fci_remap(
+    bands: list[str],
+    timestamps: list[dt.datetime],
+    output_dir: Path,
+    cache_dir: Path,
+    data_cache_dir: str | None = None,
+    satellite: str = "mtg-i1",
+    remap_to: str = "goes19",
+    monthly: bool = True,
+    purge_cache: bool = False,
+) -> tuple[int, int]:
+    """Build FCI-remapped cubes on the reference satellite's grid.
+
+    Every FCI chunk file carries all 16 channels, so each repeat cycle is
+    downloaded and satpy-loaded ONCE for all requested bands (per-band loads
+    would re-read the same ~6 GB cycle N times). Bands are given as ABI
+    names ("C13") and translated via ABI_TO_FCI_BAND; stores are named like
+    the GOES remap cubes (``mtg-i1_remap_goes19_C13_YYYYMM.zarr``) so the
+    training triplet index and dataset code work unchanged.
+
+    Parameters
+    ----------
+    bands : ABI band names with an FCI twin (e.g. ["C08", "C10", "C13"])
+    timestamps : target datetimes (typically the paired A-side cube's
+        time coordinate, so time coords match across stores)
+    purge_cache : delete each repeat cycle's chunk files after processing
+        (a cycle is ~6 GB; a month of sonde-aligned times is ~1 TB transient)
+
+    Returns
+    -------
+    (n_success, n_fail) counted per (time, band) writes
+    """
+    import shutil
+
+    from zeus.datasets.core.base import DataSourceConfig
+    from zeus.datasets.sources.mtg_fci import FCI, BANDS_VIS as FCI_BANDS_VIS
+
+    from .config import ABI_TO_FCI_BAND
+    from .data_loading import _block_mean
+
+    ref_cfg = SATELLITE_CONFIGS[remap_to]
+    sat_cfg = SATELLITE_CONFIGS[satellite]
+    col_b, row_b = get_or_build_remap_lut(ref_cfg, sat_cfg, cache_dir)
+
+    missing = [b for b in bands if b not in ABI_TO_FCI_BAND]
+    if missing:
+        raise ValueError(f"No FCI twin for bands {missing}; "
+                         f"available: {sorted(ABI_TO_FCI_BAND)}")
+
+    # Split into same-native-resolution groups so satpy never has to
+    # cross-resample (mixed 1 km / 2 km loads through the native resampler
+    # on the synchronous scheduler are pathologically slow). The 1 km
+    # solar group is aggregated to the 2 km grid with a numpy block-mean.
+    vis_group = [b for b in bands if ABI_TO_FCI_BAND[b] in FCI_BANDS_VIS]
+    ir_group = [b for b in bands if ABI_TO_FCI_BAND[b] not in FCI_BANDS_VIS]
+    groups: list[tuple[str, list[str], FCI]] = []
+    for gname, gbands in (("ir", ir_group), ("vis", vis_group)):
+        if gbands:
+            groups.append((gname, gbands, FCI(
+                config=DataSourceConfig(cache_dir=data_cache_dir),
+                bands=[ABI_TO_FCI_BAND[b] for b in gbands],
+            )))
+    src = groups[0][2]  # any source: shared cycle cache dir for purge
+
+    existing_cache: dict[Path, set] = {}
+
+    def _store(band: str, t: dt.datetime) -> Path:
+        month = t.strftime("%Y%m") if monthly else None
+        return _zarr_path_for(output_dir, satellite, band, remap_to, month)
+
+    def _is_existing(band: str, t: dt.datetime) -> bool:
+        zp = _store(band, t)
+        if zp not in existing_cache:
+            existing_cache[zp] = _existing_times(zp)
+        return np.datetime64(t, "ns") in existing_cache[zp]
+
+    n_success = 0
+    n_fail = 0
+
+    for i, t in enumerate(timestamps):
+        todo = [b for b in bands if not _is_existing(b, t)]
+        if not todo:
+            n_success += len(bands)
+            continue
+
+        logger.info("[%d/%d] %s %s (%d bands)", i + 1, len(timestamps),
+                    satellite, t.strftime("%Y-%m-%d %H:%M"), len(todo))
+        for gname, gbands, gsrc in groups:
+            todo_g = [b for b in gbands if b in todo]
+            if not todo_g:
+                continue
+            try:
+                # One download + one same-area satpy load per group
+                ds_fci = gsrc.data_at_time(t)
+            except Exception as e:
+                logger.warning("  Failed to load FCI %s group at %s: %s",
+                               gname, t, e)
+                n_fail += len(todo_g)
+                continue
+
+            gnames = [ABI_TO_FCI_BAND[b] for b in gbands]
+            rad = ds_fci["Rad"].values[0]  # (band, y, x), y ascending
+            for band in todo_g:
+                arr = rad[gnames.index(ABI_TO_FCI_BAND[band])]
+                if gname == "vis":
+                    arr = _block_mean(arr, 2)  # 1 km solar -> 2 km grid
+                arr = arr[::-1].astype(np.float32)  # north-up, LUT convention
+                remapped = remap_image(arr, col_b, row_b).astype(np.float32)
+                ds_out = _scene_to_dataset(
+                    remapped, t, ref_cfg, band,
+                    long_name="FCI L1c Effective Radiance (remapped)",
+                    units=str(ds_fci["Rad"].attrs.get("units", "")),
+                )
+                zp = _store(band, t)
+                append_to_zarr(ds_out, zp)
+                existing_cache.setdefault(zp, set()).add(np.datetime64(t, "ns"))
+                n_success += 1
+
+        if purge_cache:
+            cycle_dir = src._get_cache_dir(src._snap_time(t))
+            if cycle_dir.exists():
+                # Best-effort: panfs can report "directory not empty" on the
+                # first pass (lazy entries); retry once, then leave leftovers.
+                shutil.rmtree(cycle_dir, ignore_errors=True)
+                if cycle_dir.exists():
+                    shutil.rmtree(cycle_dir, ignore_errors=True)
+
+    logger.info("%s_remap_%s [%s]: %d succeeded, %d failed",
+                satellite, remap_to, ",".join(bands), n_success, n_fail)
+    return n_success, n_fail
+
+
 def generate_timestamps(
     start: dt.datetime,
     end: dt.datetime,
@@ -447,7 +581,13 @@ def main():
                         choices=list(SATELLITE_CONFIGS.keys()),
                         help="Satellite to process")
     parser.add_argument("--band", default="C14",
-                        help="ABI band (default: C14)")
+                        help="ABI band (default: C14). For an FCI satellite "
+                             "a comma-separated list is allowed (e.g. "
+                             "C07,C08,C10,C13) — all bands come from one "
+                             "download/load per repeat cycle.")
+    parser.add_argument("--purge-fci-cache", action="store_true",
+                        help="FCI only: delete each repeat cycle's chunk files "
+                             "after processing (~6 GB/cycle transient otherwise)")
     parser.add_argument("--start", required=True,
                         help="Start time (ISO format, e.g., 2026-03-01T00:00)")
     parser.add_argument("--end", required=True,
@@ -503,6 +643,23 @@ def main():
     logger.info("  Output: %s", output_dir)
     if args.remap_to:
         logger.info("  Remap onto: %s grid", args.remap_to)
+
+    # FCI partner: multi-band per repeat cycle, always remapped
+    if args.satellite.startswith("mtg"):
+        if not args.remap_to:
+            parser.error("FCI cubes are only produced remapped; pass --remap-to")
+        process_fci_remap(
+            bands=[b.strip() for b in args.band.split(",")],
+            timestamps=timestamps,
+            output_dir=output_dir,
+            cache_dir=cache_dir,
+            data_cache_dir=args.data_cache_dir,
+            satellite=args.satellite,
+            remap_to=args.remap_to,
+            monthly=args.monthly,
+            purge_cache=args.purge_fci_cache,
+        )
+        return
 
     # Build remap LUT if remapping
     remap_lut = None

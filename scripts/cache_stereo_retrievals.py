@@ -38,6 +38,10 @@ def main():
     parser.add_argument("--hours", default="00,12", help="Comma-separated hours (default: 00,12)")
     parser.add_argument("--out-dir", default=None, help="Output Zarr directory")
     parser.add_argument("--n-iter", type=int, default=1, help="Solver iterations")
+    parser.add_argument("--solver-device", default="cpu",
+                        help="Device for the WLS solve (default cpu; 'cuda' runs "
+                             "the full-disk solve on GPU — much faster on large-"
+                             "memory GPUs, numerically identical).")
     parser.add_argument("--lowmem", action="store_true", help="Use lowmem (serial) RAFT")
     parser.add_argument("--data-dir", default=None,
                         help="Override DATA_DIR (default: BASE/data/stereo_training)")
@@ -155,7 +159,8 @@ def main():
         for k in flows:
             flows[k][:, ~valid] = np.nan
 
-        sol = solve_stereo_winds(flows, H_matrix, sat_a=SAT_A, sat_b=SAT_B, n_iter=args.n_iter)
+        sol = solve_stereo_winds(flows, H_matrix, sat_a=SAT_A, sat_b=SAT_B,
+                                 n_iter=args.n_iter, device=args.solver_device)
         u_ms, v_ms = pixels_to_wind_ms(sol["V_u"], sol["V_v"], SAT_A, dt_seconds=1.0)
 
         u_arr[ti] = u_ms

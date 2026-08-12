@@ -72,6 +72,39 @@ class TestFixedGridToGeodetic:
         assert abs(lat) < 0.01
         assert abs(lon - sat.sub_lon_deg) < 0.01
 
+    def test_sweep_y_axes_not_swapped(self):
+        """y-sweep: x must stay the E-W angle and y the N-S angle.
+
+        Regression test — sweep=y was once implemented as a full x/y swap,
+        which transposes the disk. A point due west of the SSP on the
+        equator must have y ≈ 0 and x < 0.
+        """
+        sat = HIMAWARI8_CONFIG
+        x, y = geodetic_to_fixed_grid(0.0, sat.sub_lon_deg - 30.0, sat)
+        assert abs(y) < 1e-6
+        assert x < -0.05
+        # And due north of the SSP: x ≈ 0, y > 0
+        x, y = geodetic_to_fixed_grid(30.0, sat.sub_lon_deg, sat)
+        assert abs(x) < 1e-6
+        assert y > 0.05
+
+    def test_sweep_conventions_match_pyproj(self):
+        """Both sweep conventions must agree with pyproj's geos projection."""
+        pyproj = pytest.importorskip("pyproj")
+        for sat in (GOES16_CONFIG, HIMAWARI8_CONFIG):
+            p = pyproj.Proj(
+                proj="geos", h=sat.satellite_height_m, lon_0=sat.sub_lon_deg,
+                sweep=sat.sweep, a=sat.semi_major_m, b=sat.semi_minor_m,
+            )
+            for lat, lon in [(0.0, sat.sub_lon_deg - 30.0),
+                             (35.0, sat.sub_lon_deg + 20.0),
+                             (-50.0, sat.sub_lon_deg - 10.0)]:
+                xm, ym = p(lon, lat)
+                x, y = geodetic_to_fixed_grid(lat, lon, sat)
+                # pyproj returns meters (angle * h)
+                assert abs(x * sat.satellite_height_m - xm) < 0.1
+                assert abs(y * sat.satellite_height_m - ym) < 0.1
+
 
 class TestGeodeticToFixedGrid:
     """Test forward projection: geodetic → scanning angles."""

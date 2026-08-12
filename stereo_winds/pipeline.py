@@ -32,7 +32,7 @@ from .solver import (
     pixels_to_wind_ms,
     solve_stereo_winds,
 )
-from .time_model import compute_scene_times
+from .time_model import compute_scene_dt_fields, load_abi_time_lut
 
 logger = logging.getLogger(__name__)
 
@@ -161,10 +161,10 @@ class StereoWindPipeline:
         cfg = self.config
         logger.info("Starting stereo wind retrieval for %s", t0)
 
-        # 1. Load 5 scenes in native fixed grid
+        # 1. Load 5 scenes in native fixed grid (+ actual scene timing)
         logger.info("Step 1: Loading scenes...")
         try:
-            scenes = load_stereo_scenes(
+            scenes, time_info = load_stereo_scenes(
                 t0=t0,
                 dt_minutes=cfg.dt_minutes,
                 sat_a_id=cfg.sat_a.satellite_id,
@@ -173,6 +173,7 @@ class StereoWindPipeline:
                 cache_dir=cfg.cache_dir,
                 product=cfg.product,
                 stream=cfg.stream,
+                return_times=True,
             )
         except FileNotFoundError as e:
             logger.warning("B satellite data missing: %s. Falling back to temporal-only.", e)
@@ -202,16 +203,30 @@ class StereoWindPipeline:
             images, t0, cfg.band, sat_a.satellite_id, sat_b.satellite_id,
         )
 
-        # 4. Build design matrix from parallax vectors + time offsets
+        # 4. Build design matrix from parallax vectors + per-pixel time offsets
+        # (actual acquisition-time differences: scan phase of both sensors,
+        # nearest-second cross-satellite matching)
         logger.info("Step 4: Building design matrix...")
         w_u, w_v = self._get_parallax_vectors(sat_a, sat_b)
-        scene_times = compute_scene_times(t0, cfg.dt_minutes, sat_a, sat_b)
+        lut_path = Path(cfg.abi_time_lut_path) if cfg.abi_time_lut_path \
+            else cfg.cache_dir / "abi_time_model.nc"
+        abi_lut = None
+        if lut_path.exists() and sat_a.satellite_id.startswith("goes"):
+            logger.info("  Using ABI per-pixel time LUT: %s", lut_path.name)
+            abi_lut = load_abi_time_lut(str(lut_path))
+        scene_dts = compute_scene_dt_fields(time_info, sat_a, sat_b, col_b, row_b,
+                                            abi_time_lut=abi_lut)
+        for name in ("B_minus", "B_plus"):
+            nominal = (time_info[name]["t_nominal"] - t0).total_seconds()
+            actual = float(np.nanmedian(scene_dts[name]))
+            logger.info("  %s dt: nominal %+.0fs, median actual %+.1fs",
+                        name, nominal, actual)
         H_matrix = build_design_matrix(
             w_u, w_v,
-            dt_a_minus=scene_times["A_minus"],
-            dt_a_plus=scene_times["A_plus"],
-            dt_b_minus=scene_times["B_minus"],
-            dt_b_plus=scene_times["B_plus"],
+            dt_a_minus=scene_dts["A_minus"],
+            dt_a_plus=scene_dts["A_plus"],
+            dt_b_minus=scene_dts["B_minus"],
+            dt_b_plus=scene_dts["B_plus"],
         )
 
         # 5. Solve 5-state WLS (iterative)

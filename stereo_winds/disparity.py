@@ -143,6 +143,12 @@ class StereoDisparity:
         # D2: A0 → A_plus (temporal forward)
         disparities["D2"] = self._run_pair(a0, images["A_plus"])
 
+        # D3/D4 may be cross-INSTRUMENT pairs (e.g. GOES ABI vs remapped
+        # MTG FCI). FlowRunner.preprocess applies per-image histogram
+        # equalization, which removes inter-instrument gain/offset and
+        # (monotone) calibration differences before RAFT — no additional
+        # radiometric matching is needed here.
+
         # D3: A0 → B_minus (cross-satellite backward)
         disparities["D3"] = self._run_pair(a0, images["B_minus"])
 
