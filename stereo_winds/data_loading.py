@@ -118,13 +118,16 @@ def _coarsen_to_canonical(
     Returns (data, cfg, factor); factor == 1 means no-op.
     """
     canonical = SATELLITE_CONFIGS.get(satellite_id)
-    if canonical is None or cfg.n_rows <= canonical.n_rows:
+    if canonical is None:
         return data, cfg, 1
-    f = int(round(cfg.n_rows / canonical.n_rows))
-    if f <= 1 or cfg.n_rows % canonical.n_rows:
+    # Derive the factor from the angular scale (not grid size) so sector
+    # products (RadC/RadM), whose hi-res grids are smaller than the
+    # canonical full disk, coarsen correctly too.
+    f = int(round(canonical.scale_x / cfg.scale_x))
+    if f <= 1 or cfg.n_rows % f or cfg.n_cols % f:
         return data, cfg, 1
     logger.info("  coarsening %dx%d -> %dx%d (factor %d)",
-                cfg.n_rows, cfg.n_cols, canonical.n_rows, canonical.n_cols, f)
+                cfg.n_rows, cfg.n_cols, cfg.n_rows // f, cfg.n_cols // f, f)
     data = _block_mean(data, f)
     from dataclasses import replace
     cfg = replace(
@@ -265,6 +268,24 @@ def _ensure_band_downloaded(source, t: dt.datetime, band: str) -> None:
             source._download_file(remote, local)
 
 
+def _rad_to_bt(data: np.ndarray, attrs: dict) -> np.ndarray:
+    """Convert ABI L1b radiance to brightness temperature (K).
+
+    Uses the file's Planck constants (emissive bands C07-C16 only).
+    """
+    missing = [k for k in ("planck_fk1", "planck_fk2", "planck_bc1", "planck_bc2")
+               if k not in attrs]
+    if missing:
+        raise ValueError(
+            f"No Planck constants in scene attrs ({missing}); brightness "
+            "temperature is only defined for emissive bands (C07-C16)")
+    fk1, fk2 = attrs["planck_fk1"], attrs["planck_fk2"]
+    bc1, bc2 = attrs["planck_bc1"], attrs["planck_bc2"]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return ((fk2 / np.log(fk1 / data.astype(np.float64) + 1.0) - bc1)
+                / bc2).astype(np.float32)
+
+
 def load_goes_scene(
     t: dt.datetime,
     band: str,
@@ -273,6 +294,7 @@ def load_goes_scene(
     product: str = "ABI-L1b-RadF",
     stream: bool = False,
     return_aux: bool = False,
+    quantity: str = "rad",
 ):
     """Load a GOES ABI scene using zeus, returning native fixed-grid data.
 
@@ -290,6 +312,9 @@ def load_goes_scene(
     stream : if True, read directly from S3 without caching to disk
     return_aux : if True, also return an aux dict with the actual
         observation "t_start"/"t_end" (datetime or None)
+    quantity : "rad" (default, native L1b radiance) or "bt" (brightness
+        temperature, emissive bands only — the quantity the student's
+        training cubes carry)
 
     Returns
     -------
@@ -310,6 +335,10 @@ def load_goes_scene(
 
     # Extract 2D array: squeeze time and band dims
     data = ds["Rad"].values[0, 0, :, :].astype(np.float32)
+    if quantity == "bt":
+        data = _rad_to_bt(data, ds["Rad"].attrs)
+    elif quantity != "rad":
+        raise ValueError(f"quantity must be 'rad' or 'bt', got {quantity!r}")
 
     # Flip y: satpy returns south→north, we need north→south (row 0 = north)
     data = data[::-1]

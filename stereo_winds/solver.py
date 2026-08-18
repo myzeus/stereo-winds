@@ -84,7 +84,8 @@ def compute_parallax_vectors(
 
 def _precompute_latlon(sat_a: SatelliteConfig) -> tuple[np.ndarray, np.ndarray]:
     """Precompute lat/lon grid for sat_a (cached)."""
-    cache_key = f"{sat_a.satellite_id}_{sat_a.n_rows}_{sat_a.n_cols}"
+    cache_key = (f"{sat_a.satellite_id}_{sat_a.n_rows}_{sat_a.n_cols}"
+                 f"_{sat_a.x_offset:.9f}_{sat_a.y_offset:.9f}")
     if not hasattr(_precompute_latlon, "_cache"):
         _precompute_latlon._cache = {}
     if cache_key in _precompute_latlon._cache:

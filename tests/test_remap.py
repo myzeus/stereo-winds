@@ -1,10 +1,12 @@
 """Tests for cross-satellite remapping."""
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 from stereo_winds.config import GOES16_CONFIG, GOES18_CONFIG, SatelliteConfig
-from stereo_winds.remap import build_remap_lut, remap_image
+from stereo_winds.remap import build_remap_lut, compute_valid_mask, remap_image
 
 
 class TestBuildRemapLUT:
@@ -58,6 +60,62 @@ class TestBuildRemapLUT:
         col_b, row_b = build_remap_lut(sat_a, sat_b)
         assert col_b.shape == (16, 16)
         assert row_b.shape == (16, 16)
+
+
+class TestComputeValidMaskSector:
+    """B-grid in-bounds masking when satellite B is a sector product."""
+
+    def _small_config(self, base: SatelliteConfig, n: int = 32) -> SatelliteConfig:
+        return SatelliteConfig(
+            satellite_id=base.satellite_id,
+            sub_lon_deg=base.sub_lon_deg,
+            satellite_height_m=base.satellite_height_m,
+            semi_major_m=base.semi_major_m,
+            semi_minor_m=base.semi_minor_m,
+            sweep=base.sweep,
+            scale_x=base.scale_x * (base.n_cols / n),
+            scale_y=base.scale_y * (base.n_rows / n),
+            x_offset=base.x_offset,
+            y_offset=base.y_offset,
+            n_rows=n,
+            n_cols=n,
+        )
+
+    def test_sector_b_bounds_masked(self):
+        """A pixels mapping outside B's sector window must be invalid."""
+        n = 32
+        sat_a = self._small_config(GOES16_CONFIG, n)
+        # B = same geometry as A but only the central 16x16 window: the
+        # remap is then an identity shifted by the window origin (8, 8).
+        sat_b = replace(
+            sat_a,
+            x_offset=sat_a.x_offset + 8 * sat_a.scale_x,
+            y_offset=sat_a.y_offset + 8 * sat_a.scale_y,
+            n_rows=16,
+            n_cols=16,
+        )
+        col_b, row_b = build_remap_lut(sat_a, sat_b)
+        mask = compute_valid_mask(col_b, row_b, sat_a, sat_b, max_zenith=80.0)
+
+        assert mask.shape == (n, n)
+        assert mask.sum() > 0, "central window pixels should be valid"
+        # Outside the sector window the LUT coords are finite but out of
+        # B's grid bounds — must be masked.
+        assert not mask[:8, :].any()
+        assert not mask[:, :8].any()
+        assert not mask[24:, :].any()
+        assert not mask[:, 24:].any()
+        # Center of the window (disk center, both zeniths ~0) is valid
+        assert mask[16, 16]
+
+    def test_full_disk_unchanged(self):
+        """Full-disk B: bounds check is a no-op vs finiteness + zenith."""
+        n = 32
+        sat_a = self._small_config(GOES16_CONFIG, n)
+        sat_b = self._small_config(GOES18_CONFIG, n)
+        col_b, row_b = build_remap_lut(sat_a, sat_b)
+        mask = compute_valid_mask(col_b, row_b, sat_a, sat_b, max_zenith=70.0)
+        assert mask.sum() > 0
 
 
 class TestRemapImage:

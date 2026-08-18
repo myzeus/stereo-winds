@@ -235,7 +235,8 @@ def compute_pixel_scale(
     dy_m : (n_rows, n_cols) north-south ground distance per pixel (meters)
     NaN for off-Earth pixels.
     """
-    cache_key = f"{sat.satellite_id}_{sat.n_rows}_{sat.n_cols}_{sat.scale_x}"
+    cache_key = (f"{sat.satellite_id}_{sat.n_rows}_{sat.n_cols}_{sat.scale_x}"
+                 f"_{sat.x_offset:.9f}_{sat.y_offset:.9f}")
     if cache_key in _pixel_scale_cache:
         return _pixel_scale_cache[cache_key]
     cols = np.arange(sat.n_cols, dtype=np.float64)

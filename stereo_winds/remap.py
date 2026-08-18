@@ -142,7 +142,16 @@ def compute_valid_mask(
     zen_a[valid_earth] = compute_zenith_angle(lat[valid_earth], lon[valid_earth], sat_a)
     zen_b[valid_earth] = compute_zenith_angle(lat[valid_earth], lon[valid_earth], sat_b)
 
-    # Also require valid LUT entries
-    lut_valid = np.isfinite(col_b) & np.isfinite(row_b)
+    # Also require LUT entries that land inside B's grid — for full-disk B
+    # this is nearly redundant with finiteness, but for a sector product
+    # (RadC/RadM) it masks A pixels outside B's sector coverage.
+    lut_valid = (
+        np.isfinite(col_b)
+        & np.isfinite(row_b)
+        & (col_b >= 0)
+        & (col_b <= sat_b.n_cols - 1)
+        & (row_b >= 0)
+        & (row_b <= sat_b.n_rows - 1)
+    )
 
     return lut_valid & (zen_a < max_zenith) & (zen_b < max_zenith)

@@ -119,6 +119,47 @@ class TestComputeSceneDtFields:
         expected = (pt - 600.0) - (base + rows / n * 600.0)
         np.testing.assert_allclose(dts["B_minus"], expected, atol=1e-6)
 
+    def test_sector_dims_b_linear_model(self):
+        """Sector grids: A and B have different (CONUS-like) dimensions.
+
+        The B-side linear model must run over B's sector rows/duration
+        while the output stays on A's grid.
+        """
+        sat_a = SatelliteConfig(
+            satellite_id="sat_a", sub_lon_deg=-75.0, sweep="x",
+            n_rows=8, n_cols=12,
+        )
+        sat_b = SatelliteConfig(
+            satellite_id="sat_b", sub_lon_deg=-137.0, sweep="x",
+            n_rows=6, n_cols=10,
+        )
+        t0 = datetime(2026, 8, 11, 20, 0)
+        scan = timedelta(seconds=150)  # CONUS-like duration
+        mk = lambda t: {"t_nominal": t, "t_start": t, "t_end": t + scan,
+                        "pixel_time": None}
+        d = timedelta(minutes=10)
+        info = {
+            "A_minus": mk(t0 - d), "A0": mk(t0), "A_plus": mk(t0 + d),
+            "B_minus": mk(t0 - d), "B_plus": mk(t0 + d),
+        }
+        # Every A pixel maps to B's last row (row 5 of 6)
+        col_b = np.full((8, 12), 3.0)
+        row_b = np.full((8, 12), 5.0)
+        dts = compute_scene_dt_fields(info, sat_a, sat_b, col_b, row_b)
+
+        for k in ("A_minus", "A_plus", "B_minus", "B_plus"):
+            assert dts[k].shape == (8, 12), k
+
+        # Equal-duration temporal pairs: scan phase cancels exactly
+        np.testing.assert_allclose(dts["A_minus"], -600.0, atol=1e-9)
+        np.testing.assert_allclose(dts["A_plus"], 600.0, atol=1e-9)
+
+        # Cross pair at A row r: (−600 + 5/6·150) − (r/8·150)
+        rows = np.arange(8, dtype=np.float64)[:, None]
+        expected = (-600.0 + 5.0 / 6.0 * 150.0) - rows / 8.0 * 150.0
+        np.testing.assert_allclose(dts["B_minus"], np.broadcast_to(expected, (8, 12)),
+                                   atol=1e-6)
+
     def test_invalid_lut_falls_back_to_nominal(self):
         """Pixels B can't see get the nominal offset (finite design matrix)."""
         n = 10

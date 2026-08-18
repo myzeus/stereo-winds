@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import xarray as xr
 
-from .config import StereoPairConfig
+from .config import StereoPairConfig, sector_config
 from .data_loading import load_stereo_scenes
 from .disparity import StereoDisparity
 from .navigation import pixel_to_scanning_angle
@@ -53,12 +53,39 @@ class StereoWindPipeline:
         self._valid_mask = None
         self._disparity_engine = None
 
+    def _grid_tag(self, sat_a) -> str:
+        """Cache/output filename tag for non-canonical (sector) grids.
+
+        Empty for the canonical full-disk grid, so existing RadF cache files
+        and output names are unchanged; e.g. "_radc_1500x2500" for a CONUS
+        sector run. The in-memory memos (_remap_lut, _parallax_vectors) need
+        no tag: one pipeline instance serves one product/grid.
+        """
+        canonical = self.config.sat_a
+        if (sat_a.n_rows, sat_a.n_cols) == (canonical.n_rows, canonical.n_cols):
+            return ""
+        suffix = self.config.product.rsplit("-", 1)[-1].lower()
+        return f"_{suffix}_{sat_a.n_rows}x{sat_a.n_cols}"
+
+    def _dt_tag(self) -> str:
+        """Filename tag for a non-default temporal pair offset.
+
+        Empty for the historical default (10 min), so existing flow caches
+        and output names are unchanged; e.g. "_dt5" for 5-min pairs. Flows
+        and retrievals depend on dt, the remap LUT / parallax do not.
+        """
+        dt = self.config.dt_minutes
+        return "" if dt == 10.0 else f"_dt{dt:g}"
+
     def _get_remap_lut(self, sat_a, sat_b):
         """Get or build the remap LUT, using disk cache if available."""
         if self._remap_lut is not None:
             return self._remap_lut
 
-        cache_path = self.config.cache_dir / f"remap_lut_{sat_a.satellite_id}_{sat_b.satellite_id}.npz"
+        cache_path = self.config.cache_dir / (
+            f"remap_lut_{sat_a.satellite_id}_{sat_b.satellite_id}"
+            f"{self._grid_tag(sat_a)}.npz"
+        )
         if cache_path.exists():
             logger.info("Loading cached remap LUT from %s", cache_path)
             self._remap_lut = load_remap_lut(cache_path)
@@ -76,7 +103,10 @@ class StereoWindPipeline:
         if self._parallax_vectors is not None:
             return self._parallax_vectors
 
-        cache_path = self.config.cache_dir / f"parallax_{sat_a.satellite_id}_{sat_b.satellite_id}.npz"
+        cache_path = self.config.cache_dir / (
+            f"parallax_{sat_a.satellite_id}_{sat_b.satellite_id}"
+            f"{self._grid_tag(sat_a)}.npz"
+        )
         if cache_path.exists():
             logger.info("Loading cached parallax vectors from %s", cache_path)
             data = np.load(str(cache_path))
@@ -103,19 +133,21 @@ class StereoWindPipeline:
             )
         return self._disparity_engine
 
-    def _flow_cache_path(self, t0: datetime, band: str, key: str, sat_a_id: str, sat_b_id: str) -> Path:
+    def _flow_cache_path(self, t0: datetime, band: str, key: str, sat_a_id: str, sat_b_id: str,
+                         tag: str = "") -> Path:
         """Path for a cached flow file."""
         flow_dir = self.config.cache_dir / f"{t0:%Y%m%d}"
-        return flow_dir / f"flow_{sat_a_id}_{sat_b_id}_{t0:%H%Mz}_{band}_{key}.npy"
+        return flow_dir / f"flow_{sat_a_id}_{sat_b_id}_{t0:%H%Mz}_{band}{tag}_{key}.npy"
 
     def _load_or_compute_flows(
         self, images: dict[str, np.ndarray], t0: datetime, band: str, sat_a_id: str, sat_b_id: str,
+        tag: str = "",
     ) -> dict[str, np.ndarray]:
         """Load cached flows or compute with RAFT."""
         # Check cache
         cached = {}
         for key in ["D1", "D2", "D3", "D4"]:
-            p = self._flow_cache_path(t0, band, key, sat_a_id, sat_b_id)
+            p = self._flow_cache_path(t0, band, key, sat_a_id, sat_b_id, tag)
             if p.exists():
                 cached[key] = np.load(str(p))
                 if cached[key].ndim == 4:
@@ -139,7 +171,7 @@ class StereoWindPipeline:
 
         # Cache flows
         for key in ["D1", "D2", "D3", "D4"]:
-            p = self._flow_cache_path(t0, band, key, sat_a_id, sat_b_id)
+            p = self._flow_cache_path(t0, band, key, sat_a_id, sat_b_id, tag)
             p.parent.mkdir(parents=True, exist_ok=True)
             np.save(str(p), disparities[key])
         logger.info("Saved flows to cache")
@@ -181,9 +213,17 @@ class StereoWindPipeline:
 
         # Use canonical satellite configs for geometry (remap, parallax).
         # Runtime configs from satpy may have slightly different offsets
-        # which cause remap LUT shifts that inflate height errors.
-        sat_a = cfg.sat_a
-        sat_b = cfg.sat_b
+        # which cause remap LUT shifts that inflate height errors. For
+        # sector products (RadC/RadM) the sector window is snapped onto the
+        # canonical lattice instead (see sector_config).
+        sat_a = sector_config(cfg.sat_a, scenes["A0"][1])
+        sat_b = sector_config(cfg.sat_b, scenes["B_plus"][1])
+        b_minus_cfg = scenes["B_minus"][1]
+        if (b_minus_cfg.n_rows, b_minus_cfg.n_cols) != (sat_b.n_rows, sat_b.n_cols):
+            raise ValueError(
+                f"B_minus grid {b_minus_cfg.n_rows}x{b_minus_cfg.n_cols} != "
+                f"B_plus grid {sat_b.n_rows}x{sat_b.n_cols}"
+            )
 
         # 2. Remap B scenes to A's grid
         logger.info("Step 2: Remapping B scenes to A's grid...")
@@ -201,6 +241,7 @@ class StereoWindPipeline:
         logger.info("Step 3: Disparity fields...")
         disparities = self._load_or_compute_flows(
             images, t0, cfg.band, sat_a.satellite_id, sat_b.satellite_id,
+            tag=self._grid_tag(sat_a) + self._dt_tag(),
         )
 
         # 4. Build design matrix from parallax vectors + per-pixel time offsets
@@ -212,8 +253,19 @@ class StereoWindPipeline:
             else cfg.cache_dir / "abi_time_model.nc"
         abi_lut = None
         if lut_path.exists() and sat_a.satellite_id.startswith("goes"):
-            logger.info("  Using ABI per-pixel time LUT: %s", lut_path.name)
-            abi_lut = load_abi_time_lut(str(lut_path))
+            lut = load_abi_time_lut(str(lut_path))
+            if lut.shape == (sat_a.n_rows, sat_a.n_cols):
+                logger.info("  Using ABI per-pixel time LUT: %s", lut_path.name)
+                abi_lut = lut
+            else:
+                # The LUT encodes the RadF full-disk swath schedule; sector
+                # products scan differently, so fall back to the linear
+                # metadata-anchored model rather than index-shifting.
+                logger.info(
+                    "  ABI time LUT is %dx%d (full disk); skipping for %s "
+                    "grid %dx%d", *lut.shape, cfg.product,
+                    sat_a.n_rows, sat_a.n_cols,
+                )
         scene_dts = compute_scene_dt_fields(time_info, sat_a, sat_b, col_b, row_b,
                                             abi_time_lut=abi_lut)
         for name in ("B_minus", "B_plus"):
@@ -256,7 +308,10 @@ class StereoWindPipeline:
         ds = create_output_dataset(solution, sat_a, t0, cfg)
 
         if write_nc:
-            output_path = cfg.output_dir / f"stereo_winds_{t0:%Y%m%d_%H%M}.nc"
+            output_path = cfg.output_dir / (
+                f"stereo_winds_{cfg.band}{self._grid_tag(sat_a)}{self._dt_tag()}"
+                f"_{t0:%Y%m%d_%H%M}.nc"
+            )
             output_path.parent.mkdir(parents=True, exist_ok=True)
             write_netcdf(ds, output_path)
             logger.info("Output written to %s", output_path)
@@ -283,7 +338,7 @@ class StereoWindPipeline:
             stream=cfg.stream,
         )
 
-        sat_a = scenes["A0"][1]
+        sat_a = sector_config(cfg.sat_a, scenes["A0"][1])
         images = {
             "A_minus": scenes["A_minus"][0],
             "A0": scenes["A0"][0],
@@ -324,7 +379,10 @@ class StereoWindPipeline:
         ds.attrs["retrieval_mode"] = "temporal_only"
 
         if write_nc:
-            output_path = cfg.output_dir / f"stereo_winds_temporal_{t0:%Y%m%d_%H%M}.nc"
+            output_path = cfg.output_dir / (
+                f"stereo_winds_temporal_{cfg.band}{self._grid_tag(sat_a)}"
+                f"{self._dt_tag()}_{t0:%Y%m%d_%H%M}.nc"
+            )
             output_path.parent.mkdir(parents=True, exist_ok=True)
             write_netcdf(ds, output_path)
             logger.info("Temporal-only output written to %s", output_path)

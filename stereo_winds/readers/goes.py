@@ -57,6 +57,11 @@ def _abi_to_satpy_like(raw: xr.Dataset) -> xr.Dataset:
     for k in ("time_coverage_start", "time_coverage_end"):
         if k in raw.attrs:
             Rad.attrs[k] = raw.attrs[k]
+    # Planck constants (emissive bands only) so downstream can convert
+    # radiance -> brightness temperature without re-reading the file.
+    for k in ("planck_fk1", "planck_fk2", "planck_bc1", "planck_bc2"):
+        if k in raw:
+            Rad.attrs[k] = float(raw[k].values)
     ds = xr.Dataset({"Rad": Rad})
     ds.attrs["sweep_angle_axis"] = proj.get("sweep_angle_axis", "x")
     return ds

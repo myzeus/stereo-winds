@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import glob as _glob
-from dataclasses import dataclass, field
+import logging
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -109,6 +112,53 @@ SATELLITE_CONFIGS = {
     "himawari9": HIMAWARI9_CONFIG,
     "mtg-i1": MTG_I1_CONFIG,
 }
+
+
+def sector_config(
+    canonical: SatelliteConfig,
+    runtime: SatelliteConfig,
+    tol_px: float = 0.1,
+) -> SatelliteConfig:
+    """Adapt a canonical full-disk config to a sector (e.g. ABI CONUS) grid.
+
+    ABI sector products (RadC/RadM) live on the same fixed-grid lattice as
+    the full disk: same angular scale, offsets shifted by an integer number
+    of pixels. Runtime configs derived from file metadata can carry small
+    float round-off in the offsets (meters -> radians conversion), which
+    would shift the remap LUT and inflate height errors, so instead of using
+    the runtime offsets directly we snap the sector window onto the
+    canonical lattice and keep the canonical scale/ellipsoid/sub-lon.
+
+    Parameters
+    ----------
+    canonical : full-disk registry config (e.g. GOES19_CONFIG)
+    runtime : config derived from the loaded scene's metadata
+    tol_px : warn if the snap residual exceeds this many pixels
+
+    Returns
+    -------
+    SatelliteConfig — ``canonical`` unchanged for a full-disk grid, else a
+    copy with the sector's dimensions and lattice-snapped offsets.
+    """
+    if (runtime.n_rows, runtime.n_cols) == (canonical.n_rows, canonical.n_cols):
+        return canonical
+
+    col_off = (runtime.x_offset - canonical.x_offset) / canonical.scale_x
+    row_off = (runtime.y_offset - canonical.y_offset) / canonical.scale_y
+    residual = max(abs(col_off - round(col_off)), abs(row_off - round(row_off)))
+    if residual > tol_px:
+        logger.warning(
+            "Sector grid for %s is %.3f px off the canonical lattice "
+            "(col_off=%.3f, row_off=%.3f); snapping anyway",
+            runtime.satellite_id, residual, col_off, row_off,
+        )
+    return replace(
+        canonical,
+        x_offset=canonical.x_offset + round(col_off) * canonical.scale_x,
+        y_offset=canonical.y_offset + round(row_off) * canonical.scale_y,
+        n_rows=runtime.n_rows,
+        n_cols=runtime.n_cols,
+    )
 
 # ---------------------------------------------------------------------------
 # Cross-instrument band equivalence (closest spectral centers)
