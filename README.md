@@ -40,7 +40,7 @@ credentials are required**.
 - Cartopy/matplotlib (optional, `[viz]` extra)
 
 The RAFT optical-flow checkpoint (the "WindFlow" model — a RAFT network
-fine-tuned for geostationary imagery) is a separate download; point
+fine-tuned for geostationary imagery; [Vandal et al. 2022](https://doi.org/10.1145/3534678.3539345)) is a separate download; point
 `--model-ckpt` / `model_ckpt` at a local `.pt`. Lightning checkpoints are
 converted automatically. *(A download link will accompany the release.)*
 
@@ -183,3 +183,4 @@ solver follows **Carr et al. (2020)**.
 
 - Carr, J. L., Wu, D. L., Daniels, J., Friberg, M. D., Bresky, W., & Madani, H. (2020). GEO–GEO stereo-tracking of Atmospheric Motion Vectors (AMVs) from the geostationary ring. *Atmospheric Measurement Techniques*, 13, 3195–3215.
 - Teed, Z., & Deng, J. (2020). RAFT: Recurrent All-Pairs Field Transforms for Optical Flow. *ECCV 2020*.
+- Vandal, T. J., Duffy, K., McCarty, W., Sewnath, A., & Nemani, R. (2022). Dense feature tracking of atmospheric winds with deep optical flow. In *Proceedings of the 28th ACM SIGKDD Conference on Knowledge Discovery and Data Mining* (pp. 1807–1815). https://doi.org/10.1145/3534678.3539345
