@@ -6,7 +6,29 @@ build-backend = "setuptools.build_meta"
 name = "stereo-winds"
 version = "0.1.0"
 description = "Cross-satellite stereo wind retrieval from geostationary imagery"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Zeus AI and stereo-winds contributors", email = "tj@myzeus.ai"}]
 requires-python = ">=3.10"
+keywords = [
+    "atmospheric-motion-vectors",
+    "geostationary",
+    "goes",
+    "optical-flow",
+    "remote-sensing",
+    "stereo",
+    "winds",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+]
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
@@ -21,6 +43,11 @@ dependencies = [
     "pyorbital>=1.7",
 ]
 
+[project.urls]
+Homepage = "https://github.com/myzeus/stereo-winds"
+Repository = "https://github.com/myzeus/stereo-winds"
+Issues = "https://github.com/myzeus/stereo-winds/issues"
+
 [project.optional-dependencies]
 viz = [
     "matplotlib>=3.7",
@@ -30,6 +57,19 @@ train = [
     "pytorch-lightning>=2.0",
     "wandb>=0.16",
     "mpi4py>=4.0",
+    # student_xbatcher.py imports xbatcher at module level
+    "xbatcher>=0.3",
+    # lightning_module.py / student_module.py log figures at module level
+    "matplotlib>=3.7",
+    # batch.py builds dask-backed arrays when writing cubes
+    "dask>=2023.1",
+]
+validation = [
+    # EarthCARE CPR/ATLID granules are HDF5 (validation/earthcare_curtain.py)
+    "h5py>=3.8",
+    # MAAP catalog search + token exchange (scripts/collocate_earthcare.py)
+    "pystac-client>=0.7",
+    "requests>=2.28",
 ]
 dev = [
     "pytest>=7.0",

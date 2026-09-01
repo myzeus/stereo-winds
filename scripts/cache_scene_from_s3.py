@@ -12,9 +12,9 @@ Example
     python scripts/cache_scene_from_s3.py \
         --time 2025-01-08T19:00 \
         --sat-a goes16 --sat-b goes18 --band C14 \
-        --zeus-cache /explore/nobackup/people/tvandal/data/zeus_cache \
-        --lut-dir   /explore/nobackup/people/tvandal/data/stereo-winds/cache \
-        --out-dir   /explore/nobackup/people/tvandal/data/stereo-winds/zarrs/C14
+        --zeus-cache data/zeus_cache \
+        --lut-dir   data/stereo-winds/cache \
+        --out-dir   data/stereo-winds/zarrs/C14
 """
 
 from __future__ import annotations

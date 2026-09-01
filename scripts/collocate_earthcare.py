@@ -5,6 +5,11 @@ Downloads EarthCARE granules for a date range, projects cloud top height
 onto both GOES-18 and GOES-19 pixel grids, and saves a parquet catalog
 for training the stereo wind RAFT model.
 
+Requires MAAP credentials in the environment:
+    MAAP_OFFLINE_TOKEN  90-day offline token from
+                        https://portal.maap.eo.esa.int/ini/services/auth/token/90dToken.php
+    MAAP_CLIENT_SECRET  OAuth client secret for MAAP_CLIENT_ID (default "offline-token")
+
 Usage:
     python scripts/collocate_earthcare.py \
         --start 2026-02-01 --end 2026-02-28 \
@@ -38,8 +43,7 @@ MAAP_TOKEN_URL = (
     "https://iam.maap.eo.esa.int/realms/esa-maap/"
     "protocol/openid-connect/token"
 )
-MAAP_CLIENT_ID = "offline-token"
-MAAP_CLIENT_SECRET = "***REMOVED***"
+MAAP_CLIENT_ID = os.environ.get("MAAP_CLIENT_ID", "offline-token")
 MAAP_COLLECTIONS = ["JAXAL2Validated_MAAP", "EarthCAREL2Validated_MAAP"]
 MAAP_PRODUCT_TYPES = {"ACM_CLP_2B", "AC__CLP_2B"}
 
@@ -52,11 +56,17 @@ def get_access_token() -> str:
             "Set MAAP_OFFLINE_TOKEN env var. Generate at "
             "https://portal.maap.eo.esa.int/ini/services/auth/token/90dToken.php"
         )
+    client_secret = os.environ.get("MAAP_CLIENT_SECRET")
+    if not client_secret:
+        raise ValueError(
+            "Set MAAP_CLIENT_SECRET env var to the OAuth client secret for "
+            f"client_id {MAAP_CLIENT_ID!r}, issued with your MAAP account."
+        )
     resp = requests.post(
         MAAP_TOKEN_URL,
         data={
             "client_id": MAAP_CLIENT_ID,
-            "client_secret": MAAP_CLIENT_SECRET,
+            "client_secret": client_secret,
             "grant_type": "refresh_token",
             "refresh_token": offline_token,
             "scope": "offline_access openid",

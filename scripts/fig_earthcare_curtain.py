@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """Figure: EarthCARE CPR reflectivity curtain overlaid with stereo (teacher)
-and single-satellite (student) retrieved cloud-top winds, during a deep-
+and single-satellite (student) retrieved winds, during a deep-
 convection / wind-shear event.
 
 The CPR radar curtain (along-track distance x height, dBZ) is the independent
 vertical view of the cloud field.  Along the EarthCARE nadir track we sample
-each retrieval's cloud-top wind (u, v) and plot it as a wind barb *placed at
-its own retrieved cloud-top height* -- so the barbs ride the cloud tops and
+each retrieval's wind (u, v) and plot it as a wind barb *placed at
+its own retrieved feature-tracked height* -- so the barbs ride the tracked feature and
 their change along-track / with height is the wind shear.
 
     python scripts/fig_earthcare_curtain.py \
@@ -50,10 +50,12 @@ def qa_mask(u, v, h, chi2, qf, chi2_max):
     )
 
 
-def sample_along_track(ds, lat, lon, chi2_max=1.0, box=2):
+def sample_along_track(ds, lat, lon, chi2_max=1.0, box=2, h_parallax=8000.0):
     """Neighborhood-median sample of retrieval u/v/h along an EC track.
 
-    Returns u, v (m/s), h (m) arrays (NaN where no valid pixels)."""
+    `h_parallax` is the cloud height assumed when projecting the track onto the
+    fixed grid; it matters because the apparent position of a cloud shifts with
+    its height. Returns u, v (m/s), h (m) arrays (NaN where no valid pixels)."""
     u2 = ds["u_wind"].values
     v2 = ds["v_wind"].values
     h2 = ds["cloud_top_height"].values
@@ -61,7 +63,7 @@ def sample_along_track(ds, lat, lon, chi2_max=1.0, box=2):
     qf = ds["quality_flag"].values if "quality_flag" in ds else np.ones_like(h2)
     H, W = h2.shape
 
-    x, y = nav.geodetic_to_fixed_grid(lat, lon, GOES19_CONFIG, 8000.0)
+    x, y = nav.geodetic_to_fixed_grid(lat, lon, GOES19_CONFIG, h_parallax)
     col, row = nav.scanning_angle_to_pixel(x, y, GOES19_CONFIG)
     n = lat.size
     uu = np.full(n, np.nan); vv = np.full(n, np.nan); hh = np.full(n, np.nan)
@@ -123,6 +125,8 @@ def main():
     ap.add_argument("--time", default=None,
                     help="override the title timestamp (e.g. 2025-11-07T21:00) if the "
                          "bundle/granule frame time is missing")
+    ap.add_argument("--region-label", default="deep convection",
+                    help="scene descriptor in the title (e.g. 'TC outflow cirrus')")
     ap.add_argument("--corridor-km", type=float, default=75.0,
                     help="keep AMVs within this cross-track distance of the nadir track")
     ap.add_argument("--chi2-max", type=float, default=1.0)
@@ -135,7 +139,7 @@ def main():
     ap.add_argument("--dump-bundle", default=None,
                     help="save curtain + sampled winds to an npz for offline re-plotting")
     ap.add_argument("--from-bundle", default=None,
-                    help="re-plot from a bundle npz (no NetCDF/granule/gh061 needed)")
+                    help="re-plot from a bundle npz (no NetCDF/granule/GPU needed)")
     ap.add_argument("--out", default=str(REPO / "figures/fig_earthcare_curtain.png"))
     args = ap.parse_args()
 
@@ -187,6 +191,8 @@ def main():
             teacher_bands.append(sample_along_track(d.squeeze(), lat, lon, args.chi2_max))
         student_bands = []
         dss = xr.open_dataset(args.student_nc)
+        if "time" in dss.dims:            # same squeeze the teacher path does
+            dss = dss.isel(time=0)
         if "band" in dss.dims:
             for bi in range(dss.sizes["band"]):
                 student_bands.append(
@@ -250,9 +256,9 @@ def main():
             if sel.size == 0:
                 continue
             ax.barbs(dist[sel], h[sel] / 1000.0, u[sel], v[sel],
-                     length=5.6, linewidth=0.7, color=color, zorder=5,
+                     length=4.3, linewidth=0.55, color=color, zorder=5,
                      alpha=0.9, barb_increments=dict(half=2.5, full=5, flag=25))
-            ax.scatter(dist[sel], h[sel] / 1000.0, s=4, color=color,
+            ax.scatter(dist[sel], h[sel] / 1000.0, s=3, color=color,
                        edgecolor="white", linewidth=0.25, zorder=6)
             drew = True
         return drew
@@ -265,9 +271,9 @@ def main():
             if ok.sum() == 0:
                 continue
             ax.barbs(dp[ok], hp[ok] / 1000.0, up[ok], vp[ok],
-                     length=5.6, linewidth=0.7, color=color, zorder=5,
+                     length=4.3, linewidth=0.55, color=color, zorder=5,
                      alpha=0.9, barb_increments=dict(half=2.5, full=5, flag=25))
-            ax.scatter(dp[ok], hp[ok] / 1000.0, s=4, color=color,
+            ax.scatter(dp[ok], hp[ok] / 1000.0, s=3, color=color,
                        edgecolor="white", linewidth=0.25, zorder=6)
             n += int(ok.sum())
         return n
@@ -275,11 +281,18 @@ def main():
     def style_ax(ax, label, show_x=True, show_y=True):
         ax.set_ylim(0, hgt.max())
         ax.set_xlim(dist.min(), dist.max())
-        ax.text(0.015, 0.94, label, transform=ax.transAxes, fontsize=9.5,
+        ax.text(0.015, 0.94, label, transform=ax.transAxes, fontsize=8.5,
                 fontweight="bold", va="top", zorder=20,
                 bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="0.6", alpha=0.95))
-        ax.set_ylabel("Height (km)") if show_y else ax.tick_params(labelleft=False)
-        ax.set_xlabel("Along-track distance (km)") if show_x else ax.tick_params(labelbottom=False)
+        ax.tick_params(labelsize=9)
+        if show_y:
+            ax.set_ylabel("Height (km)", fontsize=10)
+        else:
+            ax.tick_params(labelleft=False)
+        if show_x:
+            ax.set_xlabel("Along-track distance (km)", fontsize=10)
+        else:
+            ax.tick_params(labelbottom=False)
 
     t0 = (args.time or frame_start)[:16]
 
@@ -291,27 +304,28 @@ def main():
         draw_bands(ax, student_bands, COLOR_STUDENT)
         style_ax(ax, "", True, True)
         from matplotlib.lines import Line2D
-        ax.legend(handles=[Line2D([0], [0], color=COLOR_TEACHER, lw=2, label="Stereo teacher"),
-                           Line2D([0], [0], color=COLOR_STUDENT, lw=2, label="Single-sat student")],
+        ax.legend(handles=[Line2D([0], [0], color=COLOR_TEACHER, lw=2, label="Sonde-tuned WindFlow"),
+                           Line2D([0], [0], color=COLOR_STUDENT, lw=2, label="Single satellite student")],
                   loc="upper right", frameon=True, framealpha=0.9, fontsize=8)
         cb = fig.colorbar(pm, ax=ax, pad=0.01, fraction=0.045)
         cb.set_label("CPR reflectivity (dBZ)")
-        ax.set_title(f"EarthCARE CPR curtain + multi-band cloud-top winds  ·  "
+        ax.set_title(f"EarthCARE CPR curtain + multi-band retrieved winds  ·  "
                      f"{t0}Z  ·  lat [{lat.min():.0f}, {lat.max():.0f}]", fontsize=10)
         fig.tight_layout()
     else:
-        sources = [("(a) Stereo teacher", COLOR_TEACHER, teacher_bands, "bands"),
-                   ("(b) Single-sat student", COLOR_STUDENT, student_bands, "bands"),
+        sources = [("(a) Sonde-tuned WindFlow", COLOR_TEACHER, teacher_bands, "bands"),
+                   ("(b) Single satellite student", COLOR_STUDENT, student_bands, "bands"),
                    ("(c) NOAA GOES-19 AMV", COLOR_AMV, amv_pts, "points")]
         if era5_pts is not None:
             sources.append(("(d) ERA5 reanalysis", COLOR_ERA5, era5_pts, "points"))
         n = len(sources)
-        suptitle = (f"Cloud-top winds vs. EarthCARE CPR reflectivity  ·  {t0}Z  ·  "
-                    f"ITCZ deep convection  ·  lat [{lat.min():.0f}, {lat.max():.0f}]")
+        suptitle = (f"Retrieved winds vs. EarthCARE CPR reflectivity  ·  {t0}Z  ·  "
+                    f"{args.region_label}  ·  lat [{lat.min():.0f}, {lat.max():.0f}]")
         if args.orient == "vertical":
             nrow, ncol, figsize = n, 1, (11.5, 3.6 * n)
         elif args.orient == "grid":
-            ncol = 2; nrow = int(np.ceil(n / 2)); figsize = (13.0, 4.2 * nrow)
+            # Native \textwidth sizing (~7 in) so fonts print at nominal size.
+            ncol = 2; nrow = int(np.ceil(n / 2)); figsize = (7.0, 2.35 * nrow)
         else:  # horizontal 1xN across the page top
             nrow, ncol, figsize = 1, n, (3.7 * n + 1.4, 4.3)
         fig, axes = plt.subplots(nrow, ncol, figsize=figsize,
@@ -331,6 +345,11 @@ def main():
             axflat[0].set_title(suptitle, fontsize=11)
             fig.subplots_adjust(left=0.07, right=0.90, top=0.955, bottom=0.06, hspace=0.09)
             cax = fig.add_axes([0.915, 0.06, 0.014, 0.895])
+        elif args.orient == "grid":
+            fig.suptitle(suptitle, fontsize=10, y=0.99)
+            fig.subplots_adjust(left=0.075, right=0.91, top=0.92, bottom=0.11,
+                                wspace=0.06, hspace=0.14)
+            cax = fig.add_axes([0.925, 0.11, 0.012, 0.81])
         else:
             fig.suptitle(suptitle, fontsize=10, y=0.995)
             fig.subplots_adjust(left=0.05, right=0.93, top=0.90, bottom=0.10,

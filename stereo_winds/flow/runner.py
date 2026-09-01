@@ -47,6 +47,29 @@ def image_histogram_equalization(image: np.ndarray, number_bins: int = 500) -> n
     return image_equalized.reshape(image.shape)
 
 
+def histogram_equalize(image: np.ndarray, n_bins: int = 500) -> np.ndarray:
+    """CDF-based histogram equalization to [0, 1], ignoring non-finite pixels.
+
+    Differs from :func:`image_histogram_equalization`, which zeroes non-finite
+    pixels *before* histogramming so those zeros shape the CDF. Here the
+    histogram is built from finite pixels only and non-finite positions are set
+    to 0 afterwards, so off-disk NaNs do not distort the mapping. Use this when
+    preparing full-disk scenes that are largely off-earth; use
+    ``image_histogram_equalization`` to reproduce WindFlow's exact
+    preprocessing.
+    """
+    finite = np.isfinite(image)
+    if not finite.any():
+        return np.zeros_like(image, dtype=np.float32)
+    vals = image[finite]
+    hist, bins = np.histogram(vals, n_bins, density=True)
+    cdf = hist.cumsum()
+    cdf = cdf / cdf[-1]
+    out = np.interp(image.flatten(), bins[:-1], cdf).reshape(image.shape)
+    out[~finite] = 0.0
+    return out.astype(np.float32)
+
+
 class FlowRunner:
     """Run a RAFT flow model over large images via overlapping tiles.
 

@@ -1,10 +1,10 @@
 # stereo-winds
 
-Cross-satellite stereo wind retrieval from geostationary imagery. Uses RAFT optical flow to compute disparity fields between satellite image pairs, then solves a per-pixel 5-state weighted least squares system ([Carr et al. 2020](https://doi.org/10.5194/amt-13-3195-2020)) to recover **cloud-top height** and **wind vectors** simultaneously.
+Cross-satellite stereo wind retrieval from geostationary imagery. Uses RAFT optical flow to compute disparity fields between satellite image pairs, then solves a per-pixel 5-state weighted least squares system ([Carr et al. 2020](https://doi.org/10.5194/amt-13-3195-2020)) to recover **feature-tracked height** and **wind vectors** simultaneously.
 
 ## How it works
 
-Two geostationary satellites (e.g., GOES-19 East + GOES-18 West) view the same clouds from different angles. High clouds appear shifted between the two views — this **parallax** encodes cloud-top height. Combined with temporal image pairs, the system solves for height and wind at every pixel.
+Two geostationary satellites (e.g., GOES-19 East + GOES-18 West) view the same clouds from different angles. High clouds appear shifted between the two views — this **parallax** encodes the height of the tracked feature. Combined with temporal image pairs, the system solves for height and wind at every pixel.
 
 ```
 GOES-19 (75°W)  ──┐
@@ -12,20 +12,23 @@ GOES-19 (75°W)  ──┐
 GOES-18 (137°W) ──┘
 ```
 
-**State vector per pixel:** `[h, p_u, p_v, V_u, V_v]` — cloud-top height, position corrections, and pixel velocity components.
+**State vector per pixel:** `[h, p_u, p_v, V_u, V_v]` — feature-tracked height, position corrections, and pixel velocity components.
 
-**Output:** CF-1.8 compliant NetCDF with wind vectors (m/s), cloud-top heights (m), formal uncertainties, and quality flags at the native satellite resolution (2 km for IR/WV bands, 500 m for visible).
+> **On "height":** `h` is the height of the radiometric feature RAFT tracks, which validation against EarthCARE places roughly 1–2 km *below* the active-sensor cloud top. We call it the feature-tracked height for that reason. The NetCDF variable keeps the name `cloud_top_height` for CF and downstream-consumer compatibility.
+
+**Output:** CF-1.8 compliant NetCDF with wind vectors (m/s), feature-tracked heights (m), formal uncertainties, and quality flags at the native satellite resolution (2 km for IR/WV bands, 500 m for visible).
 
 ## Installation
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/myzeus/stereo-winds.git
 cd stereo-winds
 
-pip install -e .              # core + inference (GOES-R ABI)
-pip install -e ".[viz]"       # + matplotlib/cartopy for plotting
-pip install -e ".[train]"     # + pytorch-lightning/wandb for training
-pip install -e ".[dev]"       # + pytest
+pip install -e .                 # core + inference (GOES-R ABI)
+pip install -e ".[viz]"          # + matplotlib/cartopy for plotting
+pip install -e ".[train]"        # + pytorch-lightning/wandb/xbatcher for training
+pip install -e ".[validation]"   # + h5py/pystac-client for EarthCARE and MAAP
+pip install -e ".[dev]"          # + pytest
 ```
 
 This is a self-contained build — no `zeus` submodule. GOES ABI data is read
@@ -39,12 +42,51 @@ credentials are required**.
 - NumPy, SciPy, xarray, h5netcdf, netCDF4, s3fs, zarr
 - Cartopy/matplotlib (optional, `[viz]` extra)
 
-The RAFT optical-flow checkpoint (the "WindFlow" model — a RAFT network
-fine-tuned for geostationary imagery; [Vandal et al. 2022](https://doi.org/10.1145/3534678.3539345)) is a separate download; point
-`--model-ckpt` / `model_ckpt` at a local `.pt`. Lightning checkpoints are
-converted automatically. *(A download link will accompany the release.)*
+### Checkpoints
+
+Four checkpoints ship under `checkpoints/`:
+
+| File | What it is | Provenance |
+|------|-----------|------------|
+| `windflow.raft.init-ep254.ckpt` | The exact init the sonde-tuned model was fine-tuned from — **use this as the baseline** | epoch 254 / step 255000 |
+| `windflow.raft.sonde-tuned.ckpt` | RAFT fine-tuned against IGRA radiosonde winds through the stereo solver | epoch 11 / step 75000, `height_reg_weight=1.0` |
+| `windflow.raft.pretrained.ckpt` | A separate general-purpose WindFlow RAFT for geostationary imagery ([Vandal et al. 2022](https://doi.org/10.1145/3534678.3539345)) | epoch 1434 |
+| `student.abi.mb-v3.ep21.ckpt` | Single-satellite multi-band "student" distilled from the stereo retrieval | epoch 19 / step 108482 |
+
+> **Which checkpoint is the "pre-trained" baseline? `init-ep254` — not
+> `pretrained`.** Despite its name, `windflow.raft.pretrained.ckpt` is a
+> different WindFlow lineage point (epoch 1434) and was **not** the starting
+> point for the sonde-tuned model, so tuned-vs-`pretrained` does not measure
+> the effect of fine-tuning.
+>
+> `init-ep254` is the "pre-trained WindFlow" of the paper — the baseline
+> behind the 7.25 → 5.88 m s⁻¹ (18.9%) fine-tuning result and the pre-trained
+> panels of the Carr-consistency comparison. It is verified byte-for-byte
+> against the frozen `raft_ref.*` weights embedded in the sonde-tuned
+> checkpoint, so the lineage is provable from the shipped files alone.
+> Reproducing the paper's ablation means `init-ep254` vs `sonde-tuned`.
+
+Point `--model-ckpt` / `model_ckpt` at one of these (or your own). Lightning
+checkpoints are converted automatically.
+
+The fine-tuning methodology and the QA definition used throughout are
+documented in [`SONDE_TUNING_SUMMARY.md`](SONDE_TUNING_SUMMARY.md). Note that
+its result tables are a historical record of an earlier training run, not of
+the checkpoint shipped here — see the status note at the top of that file.
 
 ## Quick start
+
+### Command line
+
+```bash
+python scripts/run_stereo.py "2024-01-15T12:00" \
+    --sat-a goes19 --sat-b goes18 --band C14 \
+    --model-ckpt checkpoints/windflow.raft.sonde-tuned.ckpt \
+    --device cuda --output-dir output/
+```
+
+Data is fetched from NOAA's public S3 buckets on demand and cached under
+`cache/`. No console script is installed; invoke the script directly.
 
 ### Python API
 
@@ -153,7 +195,7 @@ Each band senses a different atmospheric level. Running multiple bands produces 
 ## Tests
 
 ```bash
-# Run all tests (~50 tests, ~15s)
+# Run all tests (216 tests, ~40s)
 python -m pytest tests/ -v
 
 # Key test categories:
@@ -178,6 +220,23 @@ MIT — see [`LICENSE`](LICENSE). The optical-flow network under
 Deng, ECCV 2020), redistributed under BSD-3-Clause (see
 `stereo_winds/flow/raft/LICENSE-RAFT` and [`NOTICE`](NOTICE)). The retrieval
 solver follows **Carr et al. (2020)**.
+
+## Data sources
+
+The pipeline reads **GOES-R ABI L1b** from the NOAA public S3 buckets (public
+domain, no credentials). Small derived subsets used to regenerate the figures
+are committed under `figures/` and carry their own upstream terms:
+
+| Source | Used for | Terms |
+|--------|----------|-------|
+| GOES-R ABI L1b (NOAA/NESDIS) | retrieval input | public domain |
+| IGRA v2 radiosondes (NOAA/NCEI) | validation, sonde fine-tuning | public domain |
+| NOAA/NESDIS derived-motion AMVs | validation baseline | public domain |
+| ERA5 (Copernicus/ECMWF) | curtain comparison (`figures/era5_curtain.npz`) | [Copernicus licence](https://cds.climate.copernicus.eu) — attribution required |
+| EarthCARE CPR/ATLID (ESA/JAXA) | height validation (`figures/curtain_bundle.npz`) | [ESA EarthCARE terms](https://earth.esa.int/eogateway/missions/earthcare) |
+
+Contains modified Copernicus Climate Change Service information (ERA5). Neither
+the European Commission nor ECMWF is responsible for any use of this data.
 
 ## References
 

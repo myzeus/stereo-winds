@@ -11,12 +11,12 @@ embedded at each stage:
         | + parallax sensitivity w, scan-time offsets dt
     per-pixel 5-state WLS solver            [Carr et al. 2020]
         |
-    winds (barbs colored by height) + cloud-top height   [outputs]
+    winds (barbs colored by height) + feature-tracked height   [outputs]
 
 Default scene: GOES-16 (A) / GOES-18 (B), 2024-01-15 19:00 UTC, band C14, all
 cached locally under ``cache/`` (5 raw IR ``.nc`` scenes + 4 precomputed RAFT
 disparity fields ``flow_stereo_19z_D{1..4}.npy`` + remap LUT), so the figure
-builds end-to-end on CPU with no GPU / ADAPT access.
+builds end-to-end on CPU with no GPU or cluster access.
 
 Examples
 --------
@@ -436,7 +436,7 @@ def _show_flow_mag(ax, flow, vmax=None):
 
 
 def _barbs_by_height(ax, sol, good, stride, length=4.6, lw=0.5):
-    """Wind barbs colored by cloud-top height over the crop (knots)."""
+    """Wind barbs colored by feature-tracked height over the crop (knots)."""
     h = sol["h"]
     u_kt = sol["u_wind"] * MS_TO_KT
     v_kt = sol["v_wind"] * MS_TO_KT
@@ -534,7 +534,7 @@ def export_thumbs(sol, crop, scenes, flows, out_dir: Path):
         plt.imsave(out_dir / f"flow_{key}.png", mag, cmap="magma",
                    vmin=0, vmax=vmk[key], origin="upper")
 
-    # --- output: dense cloud-top height over faint IR -----------------------
+    # --- output: dense feature-tracked height over faint IR -----------------------
     fig, ax = _clean_axes(nx, ny)
     finite = np.isfinite(scenes["A0"])
     lo, hi = (np.percentile(scenes["A0"][finite], (2, 98)) if finite.any()
@@ -568,7 +568,7 @@ def export_thumbs(sol, crop, scenes, flows, out_dir: Path):
     # --- standalone height colorbars (horizontal + vertical) ----------------
     hticks = np.arange(0, 16001, 4000)
     _save_colorbar(out_dir, "colorbar_height", HCMAP, HNORM,
-                   "cloud-top height (km)", ticks=hticks,
+                   "feature-tracked height (km)", ticks=hticks,
                    ticklabels=[f"{t/1000:.0f}" for t in hticks])
 
     # --- dense formal-uncertainty fields (sigma_h, sigma_u, sigma_v) --------
@@ -614,16 +614,16 @@ def export_thumbs(sol, crop, scenes, flows, out_dir: Path):
         "cross-sat pairs another):\n"
         "  flow_D1=A0->A-, D2=A0->A+ (temporal); D3=A0->B-, D4=A0->B+ (cross-sat)\n"
         "Outputs:\n"
-        "  output_height.png            = QA cloud-top height (viridis) over faint IR\n"
+        "  output_height.png            = QA feature-tracked height (viridis) over faint IR\n"
         "  output_barbs_over_ir.png     = wind barbs colored by height over IR\n"
         "  output_barbs_transparent.png = wind barbs only, transparent background\n"
         "Formal uncertainties (cividis, QA-masked over faint IR; "
         "scaled to 98th pct):\n"
-        "  output_sigma_h.png = cloud-top height uncertainty (km)\n"
+        "  output_sigma_h.png = feature-tracked height uncertainty (km)\n"
         "  output_sigma_u.png = zonal-wind uncertainty (m/s)\n"
         "  output_sigma_v.png = meridional-wind uncertainty (m/s)\n"
         "Colorbars (transparent, _horizontal & _vertical each):\n"
-        "  colorbar_height_*  = cloud-top height scale (0-16 km)\n"
+        "  colorbar_height_*  = feature-tracked height scale (0-16 km)\n"
         "  colorbar_sigma_h_* / sigma_u_* / sigma_v_* = uncertainty scales\n"
     )
     logger.info("Wrote %d thumbnails -> %s", len(names), out_dir)
@@ -670,7 +670,7 @@ def export_thumbs_fulldisk(sol, scenes, flows, a_valid, overlap, out_dir: Path,
         plt.imsave(out_dir / f"flow_{key}.png", mag, cmap="magma",
                    vmin=0, vmax=vmk[key], origin="upper")
 
-    # --- dense cloud-top height over the coverage lens ----------------------
+    # --- dense feature-tracked height over the coverage lens ----------------------
     _save_field_over_ir(out_dir, "output_height.png", h, cov, a0d, HCMAP, HNORM)
 
     # --- dense u, v wind components (diverging, shared symmetric scale) ------
@@ -711,7 +711,7 @@ def export_thumbs_fulldisk(sol, scenes, flows, a_valid, overlap, out_dir: Path,
     # --- height colorbar ----------------------------------------------------
     hticks = np.arange(0, 16001, 4000)
     _save_colorbar(out_dir, "colorbar_height", HCMAP, HNORM,
-                   "cloud-top height (km)", ticks=hticks,
+                   "feature-tracked height (km)", ticks=hticks,
                    ticklabels=[f"{t/1000:.0f}" for t in hticks])
 
     # --- dense uncertainty fields ------------------------------------------
@@ -939,7 +939,7 @@ def build_figure(sol, crop, scenes, flows, t0, out_base: Path, overlap=None):
 
     # ===== BOTTOM TIER: outputs — single wide row of 6 maps ==============
     _stage_box(fig, (0.012, 0.045, 0.976, 0.400),
-               "Outputs — dense winds, cloud-top height & formal uncertainties")
+               "Outputs — dense winds, feature-tracked height & formal uncertainties")
 
     VCMAP = plt.get_cmap("RdBu_r")  # diverging: red +, blue −
     UCMAP = plt.get_cmap("cividis")
@@ -973,7 +973,7 @@ def build_figure(sol, crop, scenes, flows, t0, out_base: Path, overlap=None):
          VCMAP, vnorm, [-vmag, 0, vmag]),
         ("Northward wind v", "m/s", np.where(valid_w, sol["v_wind"], np.nan),
          VCMAP, vnorm, [-vmag, 0, vmag]),
-        ("Cloud-top height", "km", np.where(valid_h, sol["h"], np.nan),
+        ("Feature-tracked height", "km", np.where(valid_h, sol["h"], np.nan),
          HCMAP, HNORM, list(np.arange(0, 16001, 4000))),
         ("χ² residual", "QA keeps ≤ 0.2", np.where(cfin, chi2, np.nan),
          plt.get_cmap("magma"), cnorm, [0.0, QA["chi2_max"], cvmax]),
@@ -1087,7 +1087,7 @@ def build_fulldisk_figure(sol, a0_rad, overlap, sat_a, t0, out_base: Path,
 
     cax = fig.add_axes([0.22, 0.055, 0.56, 0.013])
     cb = fig.colorbar(im, cax=cax, orientation="horizontal")
-    cb.set_label("cloud-top height (km)", fontsize=8.5)
+    cb.set_label("feature-tracked height (km)", fontsize=8.5)
     cb.set_ticks(np.arange(0, 16001, 4000))
     cb.set_ticklabels([f"{t/1000:.0f}" for t in np.arange(0, 16001, 4000)])
     cb.ax.tick_params(labelsize=7.5)
@@ -1175,11 +1175,11 @@ def write_caption(path: Path, t0, crop, sol, good):
         "pairs whose displacement encodes height-dependent parallax. The eight "
         "displacement components (u, v of each pair) feed a per-pixel 5-state "
         "weighted least-squares solver (Carr et al., 2020) that recovers the "
-        "state vector x = [h, p_u, p_v, V_u, V_v] — cloud-top height, "
+        "state vector x = [h, p_u, p_v, V_u, V_v] — feature-tracked height, "
         "co-registration offset, and pixel velocity — using the parallax "
         "sensitivity w(h) and scan-time offsets Δt as the design matrix. "
         "Outputs are the dense eastward (u) and northward (v) wind components "
-        "and cloud-top height (shown as maps), plus formal uncertainties and "
+        "and feature-tracked height (shown as maps), plus formal uncertainties and "
         "χ². The output maps show only quality-controlled retrievals. "
         f"Displayed crop: rows {r0}:{r1}, cols {c0}:{c1} of the GOES-16 fixed "
         "grid (cross-satellite overlap). Retrieved here: median height "

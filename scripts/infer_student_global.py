@@ -398,7 +398,7 @@ def main():
         axes[1, 0].imshow(speed, cmap="turbo", vmin=0, vmax=60),
         axes[1, 1].imshow(h_m / 1000.0, cmap="turbo", vmin=0, vmax=18),
     ]
-    titles = ["u (m/s)", "v (m/s)", "wind speed (m/s)", "cloud-top height (km)"]
+    titles = ["u (m/s)", "v (m/s)", "wind speed (m/s)", "feature-tracked height (km)"]
     for ax, im, t in zip(axes.flat, ims, titles):
         ax.set_title(t); ax.set_xticks([]); ax.set_yticks([])
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.02)

@@ -11,7 +11,7 @@ height (Eq. 8 bracketing scheme).  QA gate = the eval_from_parquet standard
 Layout mirrors the fine-tuning figure: 2x3 hexbin (rows teacher/student;
 cols u, v, speed; retrieved vs sonde) + a per-band RMSVD bar row.
 
-    # on ADAPT (reads full-disk zarrs + parquet), dump the small matched table:
+    # on a GPU node (reads full-disk zarrs + parquet), dump the small matched table:
     python scripts/fig_student_teacher_igra.py \
         --teacher-cache-dir .../quad_test/cache --student-dir .../student_eval_mb \
         --parquet .../igra_all_collocation.parquet \
@@ -238,11 +238,19 @@ def main():
                              np.hypot(uhs, vhs), np.hypot(urs, vrs)])
     lim_s = np.ceil((float(np.nanmax(sp_all)) + 1e-6) / 5) * 5
 
-    fig = plt.figure(figsize=(12.5, 11.6))
+    # Native \textwidth sizing (~7 in) so fonts print at their nominal size.
+    fig = plt.figure(figsize=(7.0, 7.0))
     gs = GridSpec(3, 3, figure=fig, height_ratios=[1, 1, 0.85],
-                  hspace=0.30, wspace=0.28, left=0.07, right=0.91, top=0.945, bottom=0.055)
-    rows = [("Teacher — cross-satellite stereo", uht, vht, urt, vrt),
-            ("Student — single-satellite", uhs, vhs, urs, vrs)]
+                  hspace=0.38, wspace=0.42, left=0.11, right=0.89,
+                  top=0.925, bottom=0.07)
+    letters = "abcdefg"
+
+    def _tag(ax, k):
+        ax.text(0.0, 1.03, f"({letters[k]})", transform=ax.transAxes,
+                va="bottom", ha="left", fontsize=9, fontweight="bold")
+
+    rows = [("Sonde-tuned WindFlow", uht, vht, urt, vrt),
+            ("Single satellite student", uhs, vhs, urs, vrs)]
     col_specs = [("u", "$u$", -lim_u, lim_u, False),
                  ("v", "$v$", -lim_v, lim_v, False),
                  ("speed", "wind speed", 0, lim_s, True)]
@@ -265,14 +273,15 @@ def main():
                 bias = float(np.mean(y - x)); rmse = float(np.sqrt(np.mean((y - x) ** 2)))
                 stat = f"N={len(x):,}\nbias={bias:+.2f}\nRMSD={rmse:.2f}\nr={correlation(y, x):.2f}"
             ax.text(0.04, 0.96, stat, transform=ax.transAxes, va="top", ha="left",
-                    fontsize=7.5, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.5", alpha=0.9))
+                    fontsize=6.5, bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.5", alpha=0.9))
             ax.set_xlabel(f"Radiosonde {clabel} (m s$^{{-1}}$)")
             ax.set_ylabel(f"Retrieved {clabel} (m s$^{{-1}}$)")
             if i == 0:
-                ax.set_title(clabel, fontsize=11)
+                ax.set_title(clabel, fontsize=10)
             if j == 0:
-                ax.text(-0.30, 0.5, rlabel, transform=ax.transAxes, rotation=90,
-                        va="center", ha="center", fontsize=10.5, fontweight="bold")
+                ax.text(-0.42, 0.5, rlabel, transform=ax.transAxes, rotation=90,
+                        va="center", ha="center", fontsize=8.5, fontweight="bold")
+            _tag(ax, i * 3 + j)
     vmax = max(hb.get_array().max() for hb in hbs)
     for hb in hbs:
         hb.set_norm(LogNorm(vmin=1, vmax=vmax))
@@ -285,26 +294,28 @@ def main():
     axb = fig.add_subplot(gs[2, :])
     if len(bar_df):
         x = np.arange(len(bar_df)); w = 0.38
-        axb.bar(x - w / 2, bar_df["rmsvd_t"], w, label="Teacher (stereo)", color=COLOR_TEACHER)
-        axb.bar(x + w / 2, bar_df["rmsvd_s"], w, label="Student (single-sat)", color=COLOR_STUDENT)
+        axb.bar(x - w / 2, bar_df["rmsvd_t"], w, label="Sonde-tuned WindFlow", color=COLOR_TEACHER)
+        axb.bar(x + w / 2, bar_df["rmsvd_s"], w, label="Single satellite student", color=COLOR_STUDENT)
         for xi, row in zip(x, bar_df.itertuples()):
             top = max(row.rmsvd_t, row.rmsvd_s)
             axb.text(xi, top + 0.15, f"{row.gap:+.0f}%\n(N={row.n})", ha="center",
-                     va="bottom", fontsize=8, color="0.3")
+                     va="bottom", fontsize=7, color="0.3")
         axb.set_xticks(x); axb.set_xticklabels(bar_df["band"])
         axb.set_ylabel("RMSVD (m s$^{-1}$)")
         axb.set_ylim(0, float(bar_df[["rmsvd_t", "rmsvd_s"]].values.max()) * 1.25)
-        axb.legend(loc="upper left", fontsize=9, bbox_to_anchor=(0.0, 1.0))
+        axb.legend(loc="upper left", fontsize=8, bbox_to_anchor=(0.0, 1.0))
         axb.set_title("Per-band RMSVD vs held-out radiosondes "
-                      "(label = student excess over teacher)", fontsize=11)
+                      "(label = student excess)", fontsize=10,
+                      fontweight="normal")
+        _tag(axb, 6)
     if dropped:
-        axb.text(0.01, 0.97, f"excluded (N<{args.min_common}): {', '.join(dropped)}",
-                 transform=axb.transAxes, va="top", fontsize=8, color="0.4")
+        axb.text(0.99, 0.97, f"excluded (N<{args.min_common}): {', '.join(dropped)}",
+                 transform=axb.transAxes, va="top", ha="right", fontsize=7, color="0.4")
 
     fig.suptitle(
         f"Retrieved winds vs held-out radiosondes  ·  RMSVD {rv_t_all:.2f} / "
         f"{rv_s_all:.2f} m s$^{{-1}}$  ($\\chi^2\\!\\leq\\!{args.chi2_max:g}$, N={len(merged):,})",
-        fontsize=12, fontweight="bold", y=0.99)
+        fontsize=10, y=0.985)
     for ext in ("png", "pdf"):
         fig.savefig(str(Path(args.out).with_suffix(f".{ext}")), dpi=300, bbox_inches="tight")
         print(f"=== wrote {Path(args.out).with_suffix('.' + ext)}")

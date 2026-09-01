@@ -4,16 +4,18 @@
 # perceptually uniform — never jet/turbo). Figure code reads it back via
 # plt.rcParams["image.cmap"] so there is a single source of truth.
 
-# Fonts
-font.family:        sans-serif
-font.sans-serif:    DejaVu Sans, Arial, Helvetica
+# Fonts — paper body uses mathptmx (Times); stix mathtext blends with Times
+font.family:        serif
+font.serif:         Times New Roman, Times, Nimbus Roman, STIXGeneral, DejaVu Serif
+mathtext.fontset:   stix
 font.size:          9
 axes.titlesize:     10
 axes.labelsize:     9
 xtick.labelsize:    8
 ytick.labelsize:    8
 legend.fontsize:    8
-figure.titlesize:   12
+figure.titlesize:   11
+figure.titleweight: normal
 
 # Colormap (single source of truth for retrieved-height coloring)
 image.cmap:         viridis

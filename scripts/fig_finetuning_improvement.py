@@ -185,8 +185,8 @@ def _lim(vals, step=5):
 def main():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--cache-dir", required=True)
-    p.add_argument("--parquet", required=True)
+    p.add_argument("--cache-dir", default=None)
+    p.add_argument("--parquet", default=None)
     p.add_argument("--label-pre", default="init_ep254")
     p.add_argument("--label-tuned", default="hreg1s75")
     p.add_argument("--bands", nargs="+", default=["C08", "C09", "C10", "C12", "C14"])
@@ -196,41 +196,52 @@ def main():
                    help="drop a band from the bar panel if N_common < this")
     p.add_argument("--out", default=str(BASE / "figures" / "fig_finetuning_improvement_sonde.png"))
     p.add_argument("--dump", default=None, help="optional parquet dump of merged collocations")
+    p.add_argument("--from-dump", default=None,
+                   help="re-plot from a --dump parquet (no caches/parquet needed)")
     args = p.parse_args()
 
-    months_ym = [m.replace("-", "") for m in args.months]
-    print(f"=== Loading IGRA parquet: {args.parquet}")
-    df = pd.read_parquet(args.parquet)
-    print(f"    {len(df)} rows, {df['station_idx'].nunique()} stations; "
-          f"val stations (idx%{VAL_STATION_MOD}==0): "
-          f"{sum(int(s)%VAL_STATION_MOD==0 for s in df['station_idx'].unique())}")
+    if args.from_dump:
+        if args.from_dump.endswith(".csv"):     # CSV path needs no pyarrow
+            merged = pd.read_csv(args.from_dump)
+        else:
+            merged = pd.read_parquet(args.from_dump)
+        print(f"=== Loaded merged collocations from {args.from_dump}: N={len(merged)}")
+    else:
+        if not (args.cache_dir and args.parquet):
+            raise SystemExit("--cache-dir and --parquet are required unless --from-dump")
+        months_ym = [m.replace("-", "") for m in args.months]
+        print(f"=== Loading IGRA parquet: {args.parquet}")
+        df = pd.read_parquet(args.parquet)
+        print(f"    {len(df)} rows, {df['station_idx'].nunique()} stations; "
+              f"val stations (idx%{VAL_STATION_MOD}==0): "
+              f"{sum(int(s)%VAL_STATION_MOD==0 for s in df['station_idx'].unique())}")
 
-    print("=== Collocating (pretrained) ===")
-    dpre = collect(args.cache_dir, args.label_pre, args.bands, months_ym, df, args.n_iter)
-    print("=== Collocating (tuned) ===")
-    dtun = collect(args.cache_dir, args.label_tuned, args.bands, months_ym, df, args.n_iter)
+        print("=== Collocating (pretrained) ===")
+        dpre = collect(args.cache_dir, args.label_pre, args.bands, months_ym, df, args.n_iter)
+        print("=== Collocating (tuned) ===")
+        dtun = collect(args.cache_dir, args.label_tuned, args.bands, months_ym, df, args.n_iter)
 
-    print("=== Holdout accounting (test months + held-out stations) ===")
-    dpre = apply_holdout(dpre, "pretrained")
-    dtun = apply_holdout(dtun, "tuned")
-    if len(dpre) == 0 or len(dtun) == 0:
-        print("!! One model has no held-out collocations yet — is generation done?")
-        if len(dpre) == 0 and len(dtun) == 0:
+        print("=== Holdout accounting (test months + held-out stations) ===")
+        dpre = apply_holdout(dpre, "pretrained")
+        dtun = apply_holdout(dtun, "tuned")
+        if len(dpre) == 0 or len(dtun) == 0:
+            print("!! One model has no held-out collocations yet — is generation done?")
+            if len(dpre) == 0 and len(dtun) == 0:
+                return
+
+        key = ["band", "station_idx", "t"]
+        merged = dpre.merge(dtun, on=key, suffixes=("_pre", "_tun"))
+        print(f"=== Inner join on {key} ===")
+        print(f"  N_pretrained={len(dpre)}  N_tuned={len(dtun)}  N_common={len(merged)}")
+        if len(merged) == 0:
+            print("!! No common collocations yet — need overlapping (band, month) for both models.")
+            print("   pretrained bands/months:",
+                  sorted(set(zip(dpre['band'], dpre['month']))) if len(dpre) else [])
+            print("   tuned bands/months:",
+                  sorted(set(zip(dtun['band'], dtun['month']))) if len(dtun) else [])
             return
-
-    key = ["band", "station_idx", "t"]
-    merged = dpre.merge(dtun, on=key, suffixes=("_pre", "_tun"))
-    print(f"=== Inner join on {key} ===")
-    print(f"  N_pretrained={len(dpre)}  N_tuned={len(dtun)}  N_common={len(merged)}")
-    if len(merged) == 0:
-        print("!! No common collocations yet — need overlapping (band, month) for both models.")
-        print("   pretrained bands/months:",
-              sorted(set(zip(dpre['band'], dpre['month']))) if len(dpre) else [])
-        print("   tuned bands/months:",
-              sorted(set(zip(dtun['band'], dtun['month']))) if len(dtun) else [])
-        return
-    if args.dump:
-        merged.to_parquet(args.dump)
+        if args.dump:
+            merged.to_parquet(args.dump)
 
     # ---- Metrics -----------------------------------------------------------
     def block(m, tag):
@@ -283,12 +294,19 @@ def main():
     print(f"=== Axis limits: u=+/-{lim_u} (max {mx_u:.1f})  v=+/-{lim_v} "
           f"(max {mx_v:.1f})  speed=0..{lim_s} (max {np.nanmax(sp_all):.1f}) ===")
 
-    fig = plt.figure(figsize=(12.5, 12.0))
+    # Native \textwidth sizing (~7 in) so fonts print at their nominal size.
+    fig = plt.figure(figsize=(7.0, 7.0))
     gs = GridSpec(3, 3, figure=fig, height_ratios=[1, 1, 0.85],
-                  hspace=0.30, wspace=0.28, left=0.08, right=0.90,
-                  top=0.92, bottom=0.07)
-    rows = [("Pretrained WindFlow", uhp, vhp, urp, vrp),
-            ("Sonde-tuned teacher", uht, vht, urt, vrt)]
+                  hspace=0.38, wspace=0.42, left=0.11, right=0.89,
+                  top=0.925, bottom=0.07)
+    letters = "abcdefg"
+
+    def _tag(ax, k):
+        ax.text(0.0, 1.03, f"({letters[k]})", transform=ax.transAxes,
+                va="bottom", ha="left", fontsize=9, fontweight="bold")
+
+    rows = [("Pre-trained WindFlow", uhp, vhp, urp, vrp),
+            ("Sonde-tuned WindFlow", uht, vht, urt, vrt)]
     col_specs = [("u", "$u$", -lim_u, lim_u, False),
                  ("v", "$v$", -lim_v, lim_v, False),
                  ("speed", "wind speed", 0, lim_s, True)]
@@ -323,15 +341,16 @@ def main():
                 r = correlation(comp_h, comp_r)
                 stat = f"N={len(x):,}\nbias={bias:+.2f}\nRMSD={rmse:.2f}\nr={r:.2f}"
             ax.text(0.04, 0.96, stat, transform=ax.transAxes, va="top", ha="left",
-                    fontsize=7.5, bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                    fontsize=6.5, bbox=dict(boxstyle="round,pad=0.3", fc="white",
                                             ec="0.5", alpha=0.9))
             ax.set_xlabel(f"Radiosonde {clabel} (m s$^{{-1}}$)")
             ax.set_ylabel(f"{rlabel.split()[0]} {clabel} (m s$^{{-1}}$)")
             if i == 0:
-                ax.set_title(clabel, fontsize=11)
+                ax.set_title(clabel, fontsize=10)
             if j == 0:
-                ax.text(-0.30, 0.5, rlabel, transform=ax.transAxes, rotation=90,
-                        va="center", ha="center", fontsize=11, fontweight="bold")
+                ax.text(-0.46, 0.5, rlabel, transform=ax.transAxes, rotation=90,
+                        va="center", ha="center", fontsize=9, fontweight="bold")
+            _tag(ax, i * 3 + j)
     # consistent hexbin color scale
     vmax = max(hb.get_array().max() for hb in hbs)
     for hb in hbs:
@@ -347,30 +366,34 @@ def main():
     axb = fig.add_subplot(gs[2, :])
     if len(bar_df):
         x = np.arange(len(bar_df)); w = 0.38
-        b1 = axb.bar(x - w / 2, bar_df["rmsvd_pre"], w, label="Pretrained WindFlow",
+        b1 = axb.bar(x - w / 2, bar_df["rmsvd_pre"], w, label="Pre-trained WindFlow",
                      color="#9aa0a6")
-        b2 = axb.bar(x + w / 2, bar_df["rmsvd_tun"], w, label="Sonde-tuned teacher",
+        b2 = axb.bar(x + w / 2, bar_df["rmsvd_tun"], w, label="Sonde-tuned WindFlow",
                      color="#e8743b")
         for xi, row in zip(x, bar_df.itertuples()):
             top = max(row.rmsvd_pre, row.rmsvd_tun)
             axb.text(xi, top + 0.15, f"{row.impr:+.0f}%\n(N={row.n})", ha="center",
-                     va="bottom", fontsize=8,
+                     va="bottom", fontsize=7,
                      color="#2a7a2a" if row.impr > 0 else "#a11")
         axb.set_xticks(x); axb.set_xticklabels(bar_df["band"])
         axb.set_ylabel("RMSVD (m s$^{-1}$)")
         axb.set_ylim(0, float(bar_df[["rmsvd_pre", "rmsvd_tun"]].values.max()) * 1.25)
-        axb.legend(loc="upper right", fontsize=9)
-        axb.set_title("Per-band RMSVD vs held-out radiosondes", fontsize=11)
+        axb.legend(loc="upper right", fontsize=8)
+        axb.set_title("Per-band RMSVD vs held-out radiosondes", fontsize=10,
+                      fontweight="normal")
+        _tag(axb, 6)
     if dropped_bands:
         axb.text(0.01, 0.97, f"excluded (N<{args.min_common}): {', '.join(dropped_bands)}",
-                 transform=axb.transAxes, va="top", fontsize=8, color="0.4")
+                 transform=axb.transAxes, va="top", fontsize=7, color="0.4")
 
     fig.suptitle(
         f"Fine-tuning improvement vs held-out IGRA radiosondes  ·  aggregate RMSVD "
         f"{rv_pre_all:.2f} → {rv_tun_all:.2f} m s$^{{-1}}$  ({impr_all:+.1f}%,  "
-        f"N={len(merged):,})", fontsize=13, fontweight="bold", y=0.975)
-    fig.savefig(args.out, dpi=300)
-    print(f"=== wrote {args.out}")
+        f"N={len(merged):,})", fontsize=10, y=0.98)
+    out_base = str(Path(args.out).with_suffix(""))
+    for ext in ("png", "pdf"):
+        fig.savefig(f"{out_base}.{ext}", dpi=300)
+    print(f"=== wrote {out_base}.{{png,pdf}}")
 
 
 if __name__ == "__main__":

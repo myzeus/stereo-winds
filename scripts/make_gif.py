@@ -11,12 +11,14 @@ Usage:
 """
 
 import sys
-sys.path.insert(0, "/home/ubuntu/stereo-winds")
-sys.path.insert(0, "/home/ubuntu/stereo-winds/zeus")
+from pathlib import Path
+
+BASE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE))
+sys.path.insert(0, str(BASE / "zeus"))
 
 import argparse
 import subprocess
-from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")

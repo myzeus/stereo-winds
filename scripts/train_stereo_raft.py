@@ -1,6 +1,7 @@
 """Train RAFT for stereo wind retrieval (EarthCARE or IGRA sonde supervision)."""
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -18,9 +19,15 @@ from stereo_winds.dataset import StereoWindsDataset, EarthCAREDataset, IGRADatas
 from stereo_winds.lightning_module import StereoWindsModule
 
 
-# --- Defaults (AWS-style; override with CLI flags on other hosts) ---
-DEFAULT_RAFT_CKPT = "/home/ubuntu/earthnet-us-east-3/cache/windflow.raft.202508.epoch254.ckpt"
-DEFAULT_DATA_DIR = Path("/home/ubuntu/earthnet-us-east-3/data/stereo_training")
+# --- Defaults: env var, then repo-relative. Override with CLI flags. ---
+# The published sonde-tuned model was fine-tuned from init-ep254, NOT from
+# windflow.raft.pretrained.ckpt (epoch 1434) — those are different models.
+DEFAULT_RAFT_CKPT = os.environ.get(
+    "STEREO_WINDS_RAFT_CKPT", str(BASE / "checkpoints" / "windflow.raft.init-ep254.ckpt")
+)
+DEFAULT_DATA_DIR = Path(
+    os.environ.get("STEREO_WINDS_TRAIN_DIR", str(BASE / "data" / "stereo_training"))
+)
 
 
 # GOES-16 (Jan 2017–Apr 2025) and GOES-19 (Apr 2025–present) share the same

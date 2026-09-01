@@ -69,7 +69,13 @@ def create_output_dataset(
         ),
         "cloud_top_height": _make_var(
             solution.get("h", np.zeros((n_rows, n_cols))),
-            "Cloud Top Height", "m", "cloud_top_altitude",
+            # The solver returns the height of the tracked radiative feature,
+            # which sits below the geometric cloud top by an amount that grows
+            # with the tracer's transparency, hence the long_name. The CF
+            # standard_name stays cloud_top_altitude deliberately: CF has no
+            # term for a feature-tracked height, and downstream tooling keys
+            # off this one.
+            "Feature-Tracked Height", "m", "cloud_top_altitude",
         ),
         "sigma_u": _make_var(
             solution.get("sigma_u", np.zeros((n_rows, n_cols))),
@@ -81,7 +87,7 @@ def create_output_dataset(
         ),
         "sigma_h": _make_var(
             solution.get("sigma_h", np.zeros((n_rows, n_cols))),
-            "Formal Uncertainty in Cloud Top Height", "m",
+            "Formal Uncertainty in Feature-Tracked Height", "m",
         ),
         "chi_squared": _make_var(
             solution.get("chi2", np.zeros((n_rows, n_cols))),
@@ -150,6 +156,7 @@ def create_output_dataset(
         ds.attrs["satellite_b"] = pair_config.sat_b.satellite_id
         ds.attrs["band"] = pair_config.band
         ds.attrs["dt_minutes"] = pair_config.dt_minutes
+        ds.attrs["product"] = pair_config.product
 
     return ds
 

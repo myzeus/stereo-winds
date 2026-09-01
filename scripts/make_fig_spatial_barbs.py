@@ -2,7 +2,7 @@
 
 Layout (GridSpec):
   Row 1 (full width): (a) tuned RAFT retrieval over the full GOES overlap, barbs
-        colored by retrieved cloud-top height over an inverted-IR background, with a
+        colored by retrieved feature-tracked height over an inverted-IR background, with a
         dashed rectangle marking the zoom region (labeled "(b)-(d)").
   Row 2 (3 cols): zoom triptych at one shared extent/projection —
         (b) Carr NCC (all vectors), (c) RAFT pretrained (strided), (d) RAFT tuned (same stride).
@@ -14,13 +14,13 @@ All panels share ONE QA (the post-hoc mask from eval_from_parquet._build_qa_mask
 ONE projection/extent, ONE perceptually-uniform colormap (cividis, from
 figures/paper.mplstyle), and identical barb scaling.
 
-Inference (RAFT -> WLS solver) runs on a GPU node (ADAPT gh006). Retrievals are cached
+Inference (RAFT -> WLS solver) runs on a GPU node. Retrievals are cached
 to NetCDF so the figure can be replotted with --from-cache (e.g. to choose --extent)
 without re-running inference.
 
 Examples
 --------
-  # On gh006 (GPU): run inference for both checkpoints, cache, render contact sheet
+  # On a GPU node: run inference for both checkpoints, cache, render contact sheet
   python scripts/make_fig_spatial_barbs.py --preview
 
   # Replot from cache once an extent is chosen (no GPU needed)
@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -74,7 +75,8 @@ from stereo_winds.time_model import compute_scene_times
 # shared threshold dict; we may override QA["chi2_max"] for the figure (logged).
 from eval_from_parquet import _build_qa_mask, QA  # noqa: E402
 # Carr loader + the histogram-equalization RAFT expects on its inputs.
-from infer_and_compare_carr import histogram_equalize, load_carr_data  # noqa: E402
+from stereo_winds.flow.runner import histogram_equalize  # noqa: E402
+from stereo_winds.validation.amv_comparison import load_carr_data  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -88,7 +90,7 @@ H_EDGES = np.linspace(H_MIN, H_MAX, N_BINS + 1)
 MS_TO_KT = 1.94384
 SCENE_NAMES = ["A_minus", "A0", "A_plus", "B_minus", "B_plus"]
 PC = ccrs.PlateCarree()
-DATA_DIR_DEFAULT = "/explore/nobackup/people/tvandal/data/stereo-winds"
+DATA_DIR_DEFAULT = os.environ.get("STEREO_WINDS_DATA_DIR", str(BASE / "data"))
 # Full GOES-16/18 overlap (panel a default extent)
 PANEL_A_EXTENT = [-135, -25, -55, 60]
 
@@ -647,7 +649,7 @@ def write_caption_tuning(path, extent, n_region, yield_full, band):
 retrieval ({band}, 2025-01-08 19:00 UTC, GOES-16/GOES-18 overlap), zoom extent
 {list(extent)} (W E S N). (a) RAFT pretrained, (b) RAFT sonde-tuned. Barbs are
 grid-cell medians of QA-passing retrievals (cells with <{20} valid pixels blank),
-colored by retrieved cloud-top height (viridis, 0-16 km). A locator inset in (a)
+colored by retrieved feature-tracked height (viridis, 0-16 km). A locator inset in (a)
 marks the zoom box within the overlap. Histograms (shared y-axis) give the per-panel
 height distribution with the median marked.
 
@@ -938,7 +940,7 @@ def _render_carr_panels(m, carr_all, tuned_all, band, region):
                label=f"level swaps (n={e['n_swap']})", zorder=5)
     ax.set_xlim(0, 16); ax.set_ylim(0, 16); ax.set_aspect("equal")
     ax.set_xlabel("Carr height (km)"); ax.set_ylabel("Tuned height (km)")
-    ax.set_title("(a)  Cloud-top height")
+    ax.set_title("(a)  Feature-tracked height")
     ax.text(0.04, 0.96, f"N={s['n']:,}\noverall bias={s['h_bias']:+.2f} km\n"
             f"RMSE={s['h_rmse']:.2f} km  r={s['h_r']:.2f}\n"
             f"low(<4km) bias={e['low']['bias']:+.2f} (n={e['low']['n']})\n"
@@ -1184,7 +1186,7 @@ def make_full_disk(carr, ds_pre, ds_tuned, sat, scene_dir, out_dir, stride, band
     """1x3 full-overlap maps (Carr / pretrained / tuned) + per-panel height histograms.
 
     Row 1: grid-median barbs over the GOES-16/18 overlap, colored by retrieved
-    cloud-top height (shared colorbar). Row 2: the retrieved-height distribution
+    feature-tracked height (shared colorbar). Row 2: the retrieved-height distribution
     behind each map (Carr's vectors, and the post-QA heights for each RAFT panel),
     shared y-axis, median marked.
     """
@@ -1237,7 +1239,7 @@ def make_full_disk(carr, ds_pre, ds_tuned, sat, scene_dir, out_dir, stride, band
         a.axvspan(4, 9, color="0.88", alpha=0.6, zorder=0)
 
     fig.suptitle("Full GOES-16/18 overlap — grid-median wind barbs colored by "
-                 "retrieved cloud-top height", fontsize=14, fontweight="bold")
+                 "retrieved feature-tracked height", fontsize=14, fontweight="bold")
     out = Path(out_dir) / f"fig_spatial_barbs_fulldisk_{band}.png"
     pdf = Path(out_dir) / f"fig_spatial_barbs_fulldisk_{band}.pdf"
     Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -1342,8 +1344,9 @@ def main():
     scene_dir = Path(args.scene_dir) if args.scene_dir else data_dir / "cache"
     parallax = Path(args.parallax) if args.parallax else \
         data_dir / "zarrs" / f"parallax_{args.sat_a}_{args.sat_b}.npz"
-    ckpt_pre = args.ckpt_pretrained or str(data_dir / "weights" / "windflow.raft.202508.epoch254.ckpt")
-    ckpt_tuned = args.ckpt_tuned or str(data_dir / "weights" / "windflow.raft.sonde-tuned.b82e.step77500.ckpt")
+    # Repo-shipped checkpoints; "pretrained" is the exact fine-tuning init.
+    ckpt_pre = args.ckpt_pretrained or str(BASE / "checkpoints" / "windflow.raft.init-ep254.ckpt")
+    ckpt_tuned = args.ckpt_tuned or str(BASE / "checkpoints" / "windflow.raft.sonde-tuned.ckpt")
     cache_dir = Path(args.output_dir) / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
 

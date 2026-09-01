@@ -25,14 +25,41 @@ Thumbs.db
 .stereo_cache/
 scripts/.stereo_cache/
 
+# Private zeus checkout (not a dependency of this package)
+zeus/
+
 # Local data, outputs, and experiment artifacts
 cache/
 data/
 carr_data/
 output/
+output_gh011/
 eval_ckpts/
+eval_artifacts/
+plots/
 images/
 images_old/
+
+# Generated figure artifacts.
+# NOTE: .gitignore does not affect already-tracked files, so the paper figures
+# committed under figures/ stay tracked and updatable. These rules only stop
+# the hundreds of regenerated/scratch renders from being swept in by
+# `git add -A`. To commit a NEW figure on purpose: git add -f figures/<name>
+figures/_*
+figures/*.png
+figures/*.pdf
+figures/*.svg
+figures/*.gif
+figures/*.npz
+figures/*.txt
+figures/*.parquet
+figures/*/
+
+# Scratch analysis outputs at the repo root
+merged_geo_map.html
+sorcerer_flight_stats.csv
+*_quad_matches.npz
+quad_matches*.npz
 
 # Training run logs
 wandb/

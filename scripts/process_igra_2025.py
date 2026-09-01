@@ -1,7 +1,11 @@
-"""Download and process IGRA 2025 data into obs-xvec ArrayLake.
+"""Download and process IGRA data into obs-xvec ArrayLake.
 
-The existing obs-xvec/igra/2025 only contains July 29 onwards. This re-runs
-the processing to fetch the full year (Jan-Dec) for stereo wind training.
+Fetches a full year of IGRA soundings (Jan-Dec) for stereo wind training.
+
+Not part of the standalone build: this script depends on a sibling ``zeus``
+checkout (for ``scripts/igra_historical_processing.py``) and on ArrayLake
+credentials, neither of which ships with this repository. It is kept for
+reference and raises a clear error if those are unavailable.
 """
 
 import argparse
@@ -10,12 +14,19 @@ import os
 import sys
 from pathlib import Path
 
-import arraylake
-
 ZEUS_DIR = Path(__file__).resolve().parent.parent / "zeus"
 sys.path.insert(0, str(ZEUS_DIR))
 
-from scripts.igra_historical_processing import year_to_xvec, download_year
+try:
+    import arraylake
+    from scripts.igra_historical_processing import year_to_xvec, download_year
+except ImportError as exc:  # pragma: no cover - depends on external checkout
+    raise ImportError(
+        "process_igra_2025.py requires the private `zeus` checkout (for "
+        "scripts/igra_historical_processing.py) and the `arraylake` package, "
+        "neither of which is part of this standalone build. IGRA collocation "
+        "for evaluation is handled by scripts/collocate_igra.py instead."
+    ) from exc
 
 
 def main():
@@ -23,7 +34,10 @@ def main():
     parser.add_argument("--year", type=int, default=2025)
     parser.add_argument(
         "--cache-dir",
-        default="/home/ubuntu/earthnet-us-east-3/cache/igra_raw",
+        default=os.environ.get(
+            "IGRA_CACHE_DIR",
+            str(Path(__file__).resolve().parent.parent / "cache" / "igra_raw"),
+        ),
         help="Cache directory for raw IGRA station files",
     )
     parser.add_argument(

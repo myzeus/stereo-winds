@@ -120,11 +120,15 @@ class TestInferOneTime:
         t0 = np.datetime64("2025-07-01T12:00")
         cubes = _make_cubes(sat, t0, set(flow_bands) | set(rad_bands), valid)
         disp = _StubDisp(seed=7)
+        # Seed the model init: the assertion below is on the *magnitude* of the
+        # denormalized height, and an unseeded head lands under the 1 km
+        # threshold for ~4.5% of initializations (min observed 737 m).
+        import torch
+        torch.manual_seed(0)
         model = StudentWindsModel(
             n_flow_bands=1, n_rad_bands=1, hidden=8, n_layers=2, context=False,
         )
         # Fake a target_sd / target_mu so h_mean is denormalized to a known scale
-        import torch
         model.target_mu.copy_(torch.tensor([0.0, 0.0, 8.0]))  # h_km mean
         model.target_sd.copy_(torch.tensor([1.0, 1.0, 1.0]))
         model.eval()

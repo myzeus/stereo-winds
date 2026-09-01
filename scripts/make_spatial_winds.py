@@ -12,7 +12,7 @@ Example
 -------
     python scripts/make_spatial_winds.py \\
         --init-zarr  $CACHE/init_ep254_202501_iter3.zarr \\
-        --tuned-zarr $CACHE/tuned_b82e_202501_iter3.zarr \\
+        --tuned-zarr $CACHE/hreg1s75_202501_iter3.zarr \\
         --source-zarr $DATA/zarrs/goes16_C14_202501.zarr \\
         --time-index 0 --stride 40 \\
         --out $RUNS/.../spatial_winds_202501_t0.png
@@ -97,7 +97,22 @@ def main():
     ap.add_argument("--extent", type=float, nargs=4, default=DEFAULT_EXTENT,
                     metavar=("W", "E", "S", "N"))
     ap.add_argument("--out", required=True)
+    ap.add_argument("--chi2-max", type=float, default=QA["chi2_max"],
+                    help="QA chi-squared cut (raise to loosen QA / pass more "
+                         "barbs; default 0.2)")
+    ap.add_argument("--no-qa", action="store_true",
+                    help="Bypass the QA mask entirely — show every finite "
+                         "retrieval (no chi2/sigma_h/gradient/speed cuts)")
+    ap.add_argument("--left-label", default="init (--init-zarr)")
+    ap.add_argument("--right-label", default="tuned (--tuned-zarr)")
     args = ap.parse_args()
+    QA["chi2_max"] = args.chi2_max
+    print(f"QA chi2_max = {QA['chi2_max']}  no_qa={args.no_qa}", flush=True)
+
+    def scene_mask(s):
+        if args.no_qa:
+            return np.isfinite(s["u"]) & np.isfinite(s["v"]) & np.isfinite(s["h"])
+        return qa_mask(**{k: s[k] for k in ["u", "v", "h", "chi2", "sigma_h", "qf"]})
 
     # Band label from the source zarr filename (e.g. goes16_C08_202501.zarr -> C08)
     import re
@@ -108,8 +123,8 @@ def main():
     st = load_scene(args.tuned_zarr, args.time_index)
     print(f"band {band}  init time {si['time']}  tuned time {st['time']}", flush=True)
 
-    qi = qa_mask(**{k: si[k] for k in ["u", "v", "h", "chi2", "sigma_h", "qf"]})
-    qt = qa_mask(**{k: st[k] for k in ["u", "v", "h", "chi2", "sigma_h", "qf"]})
+    qi = scene_mask(si)
+    qt = scene_mask(st)
     print(f"QA-pass: init {int(qi.sum()):,}  tuned {int(qt.sum()):,}", flush=True)
 
     # IR background from source zarr at the scene time
@@ -137,8 +152,8 @@ def main():
     y_sub = (rg * SAT.scale_y + SAT.y_offset) * H
 
     fig, axes = plt.subplots(1, 2, figsize=(26, 13), subplot_kw=dict(projection=geo))
-    for ax, scene, q, label in [(axes[0], si, qi, "Pretrained (epoch254)"),
-                                 (axes[1], st, qt, "Tuned (b82e step-77500)")]:
+    for ax, scene, q, label in [(axes[0], si, qi, args.left_label),
+                                 (axes[1], st, qt, args.right_label)]:
         ax.imshow(ir, origin="upper", extent=ext, cmap="gray", vmin=0, vmax=1, alpha=0.9, zorder=0)
         ax.coastlines(resolution="50m", color="cyan", linewidth=0.7)
         ax.set_extent(args.extent, crs=pc)
@@ -159,11 +174,11 @@ def main():
                 transform=ax.transAxes, ha="center", fontsize=9)
 
     sm = plt.cm.ScalarMappable(cmap=CMAP_H, norm=NORM_H); sm.set_array([])
-    cbar = fig.colorbar(sm, ax=axes, shrink=0.6, pad=0.02, label="cloud-top height")
+    cbar = fig.colorbar(sm, ax=axes, shrink=0.6, pad=0.02, label="feature-tracked height")
     cbar.set_ticks(np.arange(0, 17000, 2000))
     cbar.set_ticklabels([f"{int(t/1000)} km" for t in np.arange(0, 17000, 2000)])
     fig.suptitle("Stereo winds over GOES-16/18 overlap — pretrained vs tuned "
-                 "(barbs colored by cloud-top height)", fontsize=15, fontweight="bold", y=0.97)
+                 "(barbs colored by feature-tracked height)", fontsize=15, fontweight="bold", y=0.97)
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.out, dpi=160, bbox_inches="tight", facecolor="white")

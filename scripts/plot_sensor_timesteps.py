@@ -10,7 +10,7 @@
     (via compute_scene_dt_fields). Same-ground-pixel observations differ
     by up to ±10 min despite identical nominal timestamps.
 
-Runs offline (linear scan models; on ADAPT the FCI side can use the native
+Runs offline (linear scan models; with cluster data the FCI side can use the native
 per-pixel index_map→time-LUT field instead).
 
     python scripts/plot_sensor_timesteps.py [--out figures/sensor_timesteps.png]

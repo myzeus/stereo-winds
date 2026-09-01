@@ -1,13 +1,13 @@
 #!/usr/bin/env python
 """Full-disk wind coverage vs. QA level: a 2-row x N-column grid of GOES-19
-geostationary barb maps, barbs colored by retrieved cloud-top height.
+geostationary barb maps, barbs colored by retrieved feature-tracked height.
 
 Top row = cross-satellite stereo (teacher); bottom row = single-satellite
 student.  Columns tighten the chi-squared QA gate (No QA -> chi2<=0.3), so the
 figure shows how retrieval coverage shrinks as quality control tightens, for
 both retrievals side by side.
 
-Runs on ADAPT against the full-disk zarrs, or locally via --from-bundle:
+Runs on a GPU node against the full-disk zarrs, or locally via --from-bundle:
     python scripts/fig_coverage_qa_grid.py \
         --teacher-zarr hreg1s75_C14_202510_iter3.zarr \
         --student-zarr student_quad_ab_C14.zarr \
@@ -26,8 +26,8 @@ MS_TO_KT = 1.94384
 # (label, chi2_max or None for no-QA)
 QA_LEVELS = [("No QA", None), (r"$\chi^2\!\leq\!1.0$", 1.0),
              (r"$\chi^2\!\leq\!0.5$", 0.5), (r"$\chi^2\!\leq\!0.3$", 0.3)]
-ROWS = [("(a) Cross-satellite stereo (teacher)", "teacher"),
-        ("(b) Single-satellite student", "student")]
+ROWS = [("(a) Sonde-tuned WindFlow", "teacher"),
+        ("(b) Single satellite student", "student")]
 
 
 def qa_mask(u, v, h, chi2, sigh, qf, chi2_max):
@@ -70,8 +70,9 @@ def main():
                     help="lightest grey (fraction into Greys); >0 keeps cold cloud off pure white")
     ap.add_argument("--bt-hi", type=float, default=0.60,
                     help="darkest grey (fraction into Greys); <1 keeps warm air off pure black")
-    ap.add_argument("--no-barb-halo", action="store_true",
-                    help="disable the white outline stroke on barbs")
+    ap.add_argument("--barb-halo", action="store_true",
+                    help="add a white outline stroke on barbs (off by default: "
+                         "at paper size the halos smear into an unreadable fringe)")
     ap.add_argument("--dump-bundle", default=None)
     ap.add_argument("--from-bundle", default=None)
     ap.add_argument("--out", default="figures/fig_coverage_qa.png")
@@ -148,7 +149,7 @@ def main():
     # height-coloured barb keeps contrast against it.
     bt_cmap = LinearSegmentedColormap.from_list(
         "lightIR", plt.get_cmap("Greys")(np.linspace(args.bt_lo, args.bt_hi, 256)))
-    halo = [] if args.no_barb_halo else [pe.withStroke(linewidth=1.1, foreground="white")]
+    halo = [pe.withStroke(linewidth=0.9, foreground="white")] if args.barb_halo else []
     sat = GOES19_CONFIG
     PC = ccrs.PlateCarree()
     geo = ccrs.Geostationary(central_longitude=sat.sub_lon_deg,
@@ -157,8 +158,9 @@ def main():
     norm = Normalize(vmin=H_MIN / 1000.0, vmax=H_MAX / 1000.0)
     cmap = plt.get_cmap("cividis")
 
+    # Native \textwidth sizing (~7 in) so fonts print at their nominal size.
     nrow, ncol = len(ROWS), len(QA_LEVELS)
-    fig, axes = plt.subplots(nrow, ncol, figsize=(3.05 * ncol, 3.35 * nrow),
+    fig, axes = plt.subplots(nrow, ncol, figsize=(1.75 * ncol, 1.93 * nrow),
                              subplot_kw={"projection": geo})
     for i, (rlab, _) in enumerate(ROWS):
         for j, (clab, _) in enumerate(QA_LEVELS):
@@ -174,24 +176,24 @@ def main():
             lo, la, uk, vk, hk = panels[i][j]
             if len(lo):
                 bb = ax.barbs(lo, la, uk, vk, hk, cmap=cmap, norm=norm, transform=PC,
-                              length=3.4, linewidth=0.45, zorder=3)
+                              length=2.6, linewidth=0.35, zorder=3)
                 if halo:
                     bb.set_path_effects(halo)
             ax.text(0.5, -0.02, f"{ntot[i][j]:,} px", transform=ax.transAxes,
-                    ha="center", va="top", fontsize=7.5, color="0.3")
+                    ha="center", va="top", fontsize=6.5, color="0.3")
             if i == 0:
-                ax.set_title(clab, fontsize=11, fontweight="bold")
+                ax.set_title(clab, fontsize=9, fontweight="bold")
             if j == 0:
                 ax.text(-0.06, 0.5, rlab, transform=ax.transAxes, rotation=90,
-                        va="center", ha="right", fontsize=10, fontweight="bold")
+                        va="center", ha="right", fontsize=8, fontweight="bold")
 
     fig.suptitle(f"Full-disk retrieval coverage vs. QA threshold  ·  {args.band}  ·  "
-                 f"{tstr} UTC", fontsize=12, y=0.98)
+                 f"{tstr} UTC", fontsize=10, y=0.98)
     fig.subplots_adjust(left=0.045, right=0.90, top=0.90, bottom=0.05,
                         wspace=0.04, hspace=0.08)
     cax = fig.add_axes([0.915, 0.12, 0.013, 0.72])
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm); sm.set_array([])
-    fig.colorbar(sm, cax=cax).set_label("Retrieved cloud-top height (km)")
+    fig.colorbar(sm, cax=cax).set_label("Retrieved feature-tracked height (km)")
 
     for ext in ("png", "pdf"):
         p = Path(args.out).with_suffix(f".{ext}")
